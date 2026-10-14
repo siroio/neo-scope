@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 neo-scope contributors
 ;; Author: neo-scope contributors
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, files, matching
 ;; URL: https://github.com/siroio/neo-scope
@@ -16,6 +16,8 @@
 (require 'cl-lib)
 (require 'project)
 (require 'subr-x)
+(require 'json)
+(require 'image)
 
 (defgroup neo-scope nil "Floating fuzzy finder." :group 'convenience)
 (defcustom neo-scope-frame-ratio 0.9 "Size relative to the parent frame."
@@ -34,6 +36,20 @@
   :type 'number)
 (defcustom neo-scope-preview-delay 0.08 "Seconds before previewing selection."
   :type 'number)
+(defcustom neo-scope-ffprobe-program "ffprobe"
+  "Optional ffprobe executable for media metadata; nil disables probing."
+  :type '(choice (const nil) string))
+(defcustom neo-scope-probe-timeout 5 "Seconds allowed for one media probe."
+  :type 'number)
+(defcustom neo-scope-media-cache-size 64 "Maximum successful media results cached."
+  :type 'integer)
+(defcustom neo-scope-max-image-size (* 20 1024 1024)
+  "Maximum image file bytes decoded for preview." :type 'integer)
+(defvar neo-scope--media-cache (make-hash-table :test 'equal))
+(defvar-local neo-scope--preview-cancel nil)
+(defvar-local neo-scope--preview-token nil)
+(put 'neo-scope--preview-cancel 'permanent-local t)
+(put 'neo-scope--preview-token 'permanent-local t)
 (defcustom neo-scope-matcher #'neo-scope-fuzzy-match
   "Function accepting QUERY and candidate, returning (SCORE . POSITIONS) or nil.
 POSITIONS are zero-based character offsets in the candidate's :match string."
@@ -53,7 +69,7 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (cl-defstruct (neo-scope--state (:constructor neo-scope--make-state))
   source parent origin frame input candidates preview list-window preview-window
   input-window (generation 0) (query "") cancel query-timer match-timer
-  preview-timer all tail ids pending ranked matches (selection 0)
+  preview-timer preview-key all tail ids pending ranked matches (selection 0)
   (revision 0) (history-index -1) (draft "") status done closed)
 
 (defun neo-scope-fuzzy-match (query candidate)
@@ -204,7 +220,7 @@ files are not interpreted.  No external executable is required."
                    (funcall emit 'done nil)
                    #'ignore))))
 
-(defun neo-scope-preview (candidate buffer)
+(defun neo-scope--text-preview (candidate buffer)
   "Render CANDIDATE in owned preview BUFFER without visiting a new file.
 The source buffer's text, point and narrowing are never modified."
   (let* ((value (plist-get candidate :value)) (file (plist-get value :file))
@@ -235,10 +251,251 @@ The source buffer's text, point and narrowing are never modified."
                                                ("py" . python-mode) ("js" . js-mode)
                                                ("json" . js-mode) ("sh" . sh-mode)))))))
           (when safe-mode (delay-mode-hooks (funcall safe-mode)) (font-lock-ensure)))
+        ;; Freeze the read-only snapshot's faces before adding metadata outside
+        ;; this function.  Names containing quotes must not alter code syntax.
+        (let ((colored-text (buffer-string)))
+          (fundamental-mode)
+          (erase-buffer)
+          (insert colored-text))
         (setq-local buffer-read-only t truncate-lines t mode-line-format nil
                     header-line-format (propertize " Preview" 'face 'neo-scope-title))
         (use-local-map neo-scope-input-map)
         (goto-char (point-min)) (forward-line (1- line))
+        (set-buffer-modified-p nil)))))
+
+(defun neo-scope--stop-preview (buffer)
+  "Cancel only the probe owned by preview BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq neo-scope--preview-token nil)
+      (when neo-scope--preview-cancel
+        (funcall neo-scope--preview-cancel)
+        (setq neo-scope--preview-cancel nil)))))
+
+(defun neo-scope--preview-killed () (neo-scope--stop-preview (current-buffer)))
+
+(defun neo-scope--field (name value)
+  (format "  %-16s %s\n" (concat name ":")
+          (if (or (null value) (equal value "") (equal value "N/A")) "Unknown" value)))
+
+(defun neo-scope--heading (title)
+  (concat (propertize title 'face 'neo-scope-title) "\n\n"))
+
+(defun neo-scope--general-info (file source)
+  (let ((attrs (and file (file-attributes file))))
+    (concat (neo-scope--heading "General")
+            (neo-scope--field "Name" (neo-scope--label
+                                      (if file (file-name-nondirectory file) (buffer-name source))))
+            (neo-scope--field "Path" (and file (neo-scope--label (expand-file-name file))))
+            (neo-scope--field "Size" (if attrs (file-size-human-readable (file-attribute-size attrs) 'iec)
+                                       (and source (with-current-buffer source
+                                                     (file-size-human-readable (buffer-size) 'iec)))))
+            (neo-scope--field "Modified" (and attrs (format-time-string "%Y-%m-%d %H:%M:%S"
+                                                                                      (file-attribute-modification-time attrs))))
+            (when (and source (buffer-modified-p source)) (neo-scope--field "Buffer" "Unsaved changes"))
+            "\n")))
+
+(defun neo-scope--number (value)
+  (cond ((numberp value) value)
+        ((and (stringp value) (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" value))
+         (string-to-number value))))
+
+(defun neo-scope--duration (value)
+  (when-let* ((seconds (neo-scope--number value)))
+    (let* ((ms (round (* seconds 1000))) (s (/ ms 1000)))
+      (format "%02d:%02d:%02d.%03d" (/ s 3600) (% (/ s 60) 60) (% s 60) (% ms 1000)))))
+
+(defun neo-scope--rate (value)
+  (if (and (stringp value) (string-match "\\`\\([0-9]+\\)/\\([0-9]+\\)\\'" value))
+      (let ((n (string-to-number (match-string 1 value))) (d (string-to-number (match-string 2 value))))
+        (when (and (> n 0) (> d 0)) (/ (float n) d)))
+    (let ((n (neo-scope--number value))) (and n (> n 0) n))))
+
+(defun neo-scope--scaled (value divisor suffix)
+  (when-let* ((n (neo-scope--number value))) (format "%g %s" (/ (float n) divisor) suffix)))
+
+(defun neo-scope--media-description (data)
+  "Format ffprobe DATA, preserving multiple video and audio streams."
+  (let ((format-info (alist-get 'format data)) (index 0))
+    (concat
+     (neo-scope--field "Format" (or (alist-get 'format_long_name format-info) (alist-get 'format_name format-info)))
+     (neo-scope--field "Duration" (neo-scope--duration (alist-get 'duration format-info))) "\n"
+     (mapconcat
+      (lambda (stream)
+        (cl-incf index)
+        (let ((type (alist-get 'codec_type stream)))
+          (cond
+           ((equal type "video")
+            (concat (neo-scope--heading (format "Video · stream %s" (or (alist-get 'index stream) index)))
+                    (neo-scope--field "Resolution" (and (alist-get 'width stream) (alist-get 'height stream)
+                                                        (format "%s x %s" (alist-get 'width stream) (alist-get 'height stream))))
+                    (neo-scope--field "Codec" (alist-get 'codec_name stream))
+                    (neo-scope--field "Framerate" (when-let* ((fps (or (neo-scope--rate (alist-get 'avg_frame_rate stream))
+                                                                                      (neo-scope--rate (alist-get 'r_frame_rate stream)))))
+                                                      (format "%.3f fps" fps)))
+                    (neo-scope--field "Bitrate" (neo-scope--scaled (alist-get 'bit_rate stream) 1000 "kb/s")) "\n"))
+           ((equal type "audio")
+            (concat (neo-scope--heading (format "Audio · stream %s" (or (alist-get 'index stream) index)))
+                    (neo-scope--field "Codec" (alist-get 'codec_name stream))
+                    (neo-scope--field "Bitrate" (neo-scope--scaled (alist-get 'bit_rate stream) 1000 "kb/s"))
+                    (neo-scope--field "Sampling rate" (neo-scope--scaled (alist-get 'sample_rate stream) 1000 "kHz"))
+                    (neo-scope--field "Channels" (let ((channels (alist-get 'channels stream)) (layout (alist-get 'channel_layout stream)))
+                                                   (cond ((and channels layout) (format "%s (%s)" channels layout))
+                                                         (channels (format "%s" channels)) (layout layout)))) "\n"))
+           (t "")))) (alist-get 'streams data) ""))))
+
+(defun neo-scope--cache-key (file program)
+  (let ((attrs (file-attributes file)))
+    (list (expand-file-name file) (file-attribute-size attrs)
+          (file-attribute-modification-time attrs) (file-attribute-status-change-time attrs) program)))
+
+(defun neo-scope-clear-preview-cache ()
+  "Clear cached media metadata."
+  (interactive) (clrhash neo-scope--media-cache))
+
+(defun neo-scope--probe (file program callback)
+  "Probe local FILE using PROGRAM; CALLBACK receives (DATA ERROR).
+Return an idempotent cancel function.  Callback is never called after cancel."
+  (let ((key (neo-scope--cache-key file program)) process timeout
+        (output "") finished stderr)
+    (cl-labels
+        ((cleanup ()
+           (when (timerp timeout) (cancel-timer timeout))
+           (when process
+             (set-process-sentinel process #'ignore)
+             (when (process-live-p process) (delete-process process)))
+           (when (buffer-live-p stderr)
+             (when-let* ((err-process (get-buffer-process stderr)))
+               (delete-process err-process))
+             (kill-buffer stderr)))
+         (finish (data error-text)
+           (unless finished
+             (setq finished t)
+             (cleanup)
+             (when (and data (> neo-scope-media-cache-size 0)
+                        (equal key (neo-scope--cache-key file program)))
+               (when (>= (hash-table-count neo-scope--media-cache) neo-scope-media-cache-size)
+                 (remhash (car (hash-table-keys neo-scope--media-cache)) neo-scope--media-cache))
+               (puthash key data neo-scope--media-cache))
+             (funcall callback data error-text))))
+      (if-let* ((cached (gethash key neo-scope--media-cache)))
+          (setq timeout (run-at-time 0 nil (lambda () (finish cached nil))))
+        (condition-case err
+            (progn
+              (setq stderr (generate-new-buffer " *neo-scope-ffprobe-error*"))
+              (setq process
+                    (make-process
+                     :name "neo-scope-ffprobe" :buffer nil :stderr stderr :noquery t
+                     :connection-type 'pipe
+                     :coding (cons 'utf-8-unix (if (eq system-type 'windows-nt)
+                                                   locale-coding-system 'utf-8-unix))
+                     :command (list program "-v" "error" "-protocol_whitelist" "file"
+                                    "-show_entries"
+                                    "format=format_name,format_long_name,duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,bit_rate,sample_rate,channels,channel_layout"
+                                    "-of" "json" "-i" (expand-file-name file))
+                     :filter (lambda (_proc chunk)
+                               (unless finished
+                                 (if (> (+ (length output) (length chunk)) (* 1024 1024))
+                                     (finish nil "Metadata exceeds output limit")
+                                   (setq output (concat output chunk)))))
+                     :sentinel
+                     (lambda (proc _event)
+                       (when (and (not finished) (memq (process-status proc) '(exit signal)))
+                         (if (/= (process-exit-status proc) 0)
+                             (finish nil "ffprobe could not read this media file")
+                           (condition-case parse-error
+                               (let ((data (json-parse-string output :object-type 'alist :array-type 'array
+                                                              :null-object nil :false-object nil)))
+                                 (unless (and (listp data) (or (assq 'format data) (assq 'streams data)))
+                                   (error "No media metadata"))
+                                 (finish data nil))
+                             (error (finish nil (format "Invalid metadata: %s" (error-message-string parse-error))))))))))
+              ;; Diagnostics are deliberately not accumulated; stdout is bounded.
+              (when-let* ((err-process (get-buffer-process stderr)))
+                (set-process-filter err-process #'ignore)
+                (set-process-query-on-exit-flag err-process nil))
+              (setq timeout (run-at-time neo-scope-probe-timeout nil
+                                         (lambda () (finish nil "ffprobe timed out")))))
+          (error (setq timeout (run-at-time 0 nil (lambda () (finish nil (error-message-string err))))))))
+      (lambda () (setq finished t) (cleanup)))))
+
+(defun neo-scope--image-preview (file buffer)
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t) (type (image-supported-file-p file)))
+      (insert (neo-scope--heading "Image")
+              (neo-scope--field "Format" (upcase (or (and type (symbol-name type)) (file-name-extension file) "Unknown"))))
+      (cond
+       ((> (file-attribute-size (file-attributes file)) neo-scope-max-image-size)
+        (insert "Image exceeds preview size limit.\n"))
+       ((not (and type (image-type-available-p type)))
+        (insert "This Emacs build cannot display this image format.\n"))
+       (t
+        (let* ((image (create-image file type nil))
+               (size (image-size image t))
+               (window (get-buffer-window buffer t))
+               (width (if window (window-body-width window t) 600))
+               (height (if window (window-body-height window t) 450)))
+          (insert (neo-scope--field "Resolution" (format "%d x %d" (car size) (cdr size))) "\n")
+          (insert-image (create-image file type nil :max-width (max 1 (- width 20))
+                                      :max-height (max 1 (- height 220))))))))))
+
+(defun neo-scope-preview (candidate buffer)
+  "Render file information and type-specific content in owned BUFFER.
+Media metadata is asynchronous and optional.  Kill or replace the preview
+to cancel its process.  Existing text buffers remain unchanged."
+  (neo-scope--stop-preview buffer)
+  (let* ((value (plist-get candidate :value))
+         (source (plist-get value :buffer))
+         (file (or (plist-get value :file) (and (buffer-live-p source) (buffer-file-name source))))
+         (ext (and file (downcase (or (file-name-extension file) ""))))
+         (media (member ext '("mp4" "mkv" "webm" "mov" "avi" "m4v" "mpeg" "mpg" "wmv"
+                              "mp3" "wav" "flac" "ogg" "opus" "m4a" "aac" "wma" "aiff")))
+         (picture (member ext '("png" "jpg" "jpeg" "gif" "webp" "bmp" "tif" "tiff" "svg" "avif" "ico")))
+         (token (list candidate)) general)
+    (when (and file (file-remote-p file)) (user-error "Remote preview is not supported"))
+    (setq source (or source (and file (get-file-buffer file))))
+    (setq general (neo-scope--general-info file source))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (fundamental-mode) (erase-buffer)
+        (cond
+         ((or media picture) (insert general))
+         (t
+          (condition-case err
+              (progn
+                (neo-scope--text-preview candidate buffer)
+                (let ((position (copy-marker (point) t)))
+                  (goto-char (point-min))
+                  (insert general (neo-scope--heading "Content"))
+                  (goto-char position) (set-marker position nil)))
+            (error (erase-buffer) (insert general (error-message-string err))))))
+        (when picture
+          (condition-case err (neo-scope--image-preview file buffer)
+            (error (insert (format "Image unavailable: %s\n" (error-message-string err))))))
+        (when media
+          (if-let* ((program (and neo-scope-ffprobe-program (executable-find neo-scope-ffprobe-program))))
+              (let ((start (point-max)))
+                (setq neo-scope--preview-token token)
+                (goto-char start) (insert "Reading media information…\n")
+                (setq neo-scope--preview-cancel
+                      (neo-scope--probe
+                       file program
+                       (lambda (data error-text)
+                         (when (and (buffer-live-p buffer)
+                                    (eq token (buffer-local-value 'neo-scope--preview-token buffer)))
+                           (with-current-buffer buffer
+                             (let ((inhibit-read-only t))
+                               (save-excursion
+                                 (delete-region start (point-max)) (goto-char start)
+                                 (insert (if data (neo-scope--media-description data) error-text)))
+                               (setq neo-scope--preview-cancel nil)
+                               (set-buffer-modified-p nil))))))))
+            (insert "Install ffprobe for video/audio details (optional).\n")))
+        (when (or media picture) (goto-char (point-min)))
+        (setq-local buffer-read-only t truncate-lines t mode-line-format nil
+                    header-line-format (propertize " Preview" 'face 'neo-scope-title))
+        (use-local-map neo-scope-input-map)
+        (add-hook 'kill-buffer-hook #'neo-scope--preview-killed nil t)
         (set-buffer-modified-p nil)))))
 
 (defun neo-scope-action (candidate)
@@ -335,6 +592,8 @@ The source buffer's text, point and narrowing are never modified."
     (when (and s (neo-scope--live-p s))
       ;; Invalidate old selection immediately; RET must never open stale results.
       (cl-incf (neo-scope--state-revision s))
+      (neo-scope--stop-preview (neo-scope--state-preview s))
+      (setf (neo-scope--state-preview-key s) nil)
       (neo-scope--cancel-timer (neo-scope--state-query-timer s))
       (setf (neo-scope--state-query-timer s)
             (run-at-time neo-scope-input-delay nil #'neo-scope--query s)))))
@@ -397,18 +656,24 @@ The source buffer's text, point and narrowing are never modified."
                       (or (neo-scope--state-status s) "")))))))
 
 (defun neo-scope--schedule-preview (s)
-  (neo-scope--cancel-timer (neo-scope--state-preview-timer s))
-  (let ((revision (neo-scope--state-revision s)))
-    (setf (neo-scope--state-preview-timer s)
-          (run-at-time neo-scope-preview-delay nil
-                       (lambda ()
-                         (when (and (neo-scope--live-p s)
-                                    (= revision (neo-scope--state-revision s)))
-                           (neo-scope--show-preview s)))))))
+  (let ((key (list (neo-scope--selected s) (neo-scope--state-revision s))))
+    (unless (or (neo-scope--state-query-timer s)
+                (equal key (neo-scope--state-preview-key s)))
+      (setf (neo-scope--state-preview-key s) key)
+      (neo-scope--cancel-timer (neo-scope--state-preview-timer s))
+      (neo-scope--stop-preview (neo-scope--state-preview s))
+      (let ((revision (neo-scope--state-revision s)))
+        (setf (neo-scope--state-preview-timer s)
+              (run-at-time neo-scope-preview-delay nil
+                           (lambda ()
+                             (when (and (neo-scope--live-p s)
+                                        (= revision (neo-scope--state-revision s)))
+                               (neo-scope--show-preview s)))))))))
 
 (defun neo-scope--show-preview (s)
   (let ((buffer (neo-scope--state-preview s)) (candidate (neo-scope--selected s)))
     (when (buffer-live-p buffer)
+      (neo-scope--stop-preview buffer)
       (condition-case err
           (if candidate
               (funcall (or (plist-get (neo-scope--state-source s) :preview) #'neo-scope-preview)
@@ -453,6 +718,7 @@ The source buffer's text, point and narrowing are never modified."
   (unless (neo-scope--state-closed s)
     (setf (neo-scope--state-closed s) t)
     (when (eq s neo-scope--session) (setq neo-scope--session nil))
+    (neo-scope--stop-preview (neo-scope--state-preview s))
     (dolist (timer (list (neo-scope--state-query-timer s) (neo-scope--state-match-timer s)
                         (neo-scope--state-preview-timer s))) (neo-scope--cancel-timer timer))
     (when (neo-scope--state-cancel s) (ignore-errors (funcall (neo-scope--state-cancel s))))

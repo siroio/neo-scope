@@ -85,7 +85,7 @@
         (progn
           (with-current-buffer source (insert "first\nsecond\n") (goto-char 4) (narrow-to-region 2 5))
           (neo-scope-preview (list :value (list :buffer source)) dest)
-          (with-current-buffer dest (should (equal (buffer-string) "first\nsecond\n")))
+          (with-current-buffer dest (should (string-suffix-p "first\nsecond\n" (buffer-string))))
           (with-current-buffer source (should (= (point) 4)) (should (= (point-min) 2))))
       (kill-buffer source) (kill-buffer dest))))
 
@@ -151,7 +151,8 @@
     (unwind-protect
         (progn
           (with-temp-file file (insert "text\0binary"))
-          (should-error (neo-scope-preview (list :value (list :file file)) dest))
+          (neo-scope-preview (list :value (list :file file)) dest)
+          (with-current-buffer dest (should (string-match-p "Binary file" (buffer-string))))
           (let ((neo-scope-max-file-size 2))
             (should-error (neo-scope--read-text file))))
       (delete-file file) (kill-buffer dest))))
