@@ -37,7 +37,7 @@
         (with-current-buffer (neo-scope--state-preview neo-scope--session)
           (neo-scope-media-gui-check (string-match-p "22.05 kHz" (buffer-string)) "audio sampling rate")
           (neo-scope-media-gui-check (string-match-p "pcm_s16le" (buffer-string)) "audio codec"))
-        (neo-scope-cancel)
+        (kill-buffer (neo-scope--state-preview neo-scope--session))
         (neo-scope-media-gui-check (null neo-scope--session) "finder cleanup")
         (neo-scope-media-gui-check
          (not (cl-find-if (lambda (p) (string-prefix-p "neo-scope-ffprobe" (process-name p))) (process-list)))

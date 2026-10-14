@@ -1,4 +1,4 @@
-;;; neo-scope.el --- Standalone floating fuzzy finder -*- lexical-binding: t; -*-
+;;; neo-scope.el --- Standalone fuzzy finder -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 neo-scope contributors
 ;; Author: neo-scope contributors
@@ -19,9 +19,7 @@
 (require 'json)
 (require 'image)
 
-(defgroup neo-scope nil "Floating fuzzy finder." :group 'convenience)
-(defcustom neo-scope-frame-ratio 0.9 "Size relative to the parent frame."
-  :type 'float)
+(defgroup neo-scope nil "Fuzzy finder." :group 'convenience)
 (defcustom neo-scope-list-ratio 0.4 "Fraction of width used for candidates."
   :type 'float)
 (defcustom neo-scope-excluded-directories '(".git" ".hg" ".svn" "node_modules")
@@ -65,9 +63,12 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (defvar neo-scope-history nil "Queries entered in neo-scope.")
 (defvar neo-scope--session nil)
 (defvar neo-scope-input-map)
+(defvar neo-scope-panel-map)
 (defvar-local neo-scope--owner nil)
+(put 'neo-scope--owner 'permanent-local t)
+(put 'neo-scope--buffer-killed 'permanent-local-hook t)
 (cl-defstruct (neo-scope--state (:constructor neo-scope--make-state))
-  source parent origin frame input candidates preview list-window preview-window
+  source parent origin frame window-config input candidates preview list-window preview-window
   input-window (generation 0) (query "") cancel query-timer match-timer
   preview-timer preview-key all tail ids pending ranked matches (selection 0)
   (revision 0) (history-index -1) (draft "") status done closed)
@@ -259,7 +260,7 @@ The source buffer's text, point and narrowing are never modified."
           (insert colored-text))
         (setq-local buffer-read-only t truncate-lines t mode-line-format nil
                     header-line-format (propertize " Preview" 'face 'neo-scope-title))
-        (use-local-map neo-scope-input-map)
+        (use-local-map neo-scope-panel-map)
         (goto-char (point-min)) (forward-line (1- line))
         (set-buffer-modified-p nil)))))
 
@@ -494,7 +495,7 @@ to cancel its process.  Existing text buffers remain unchanged."
         (when (or media picture) (goto-char (point-min)))
         (setq-local buffer-read-only t truncate-lines t mode-line-format nil
                     header-line-format (propertize " Preview" 'face 'neo-scope-title))
-        (use-local-map neo-scope-input-map)
+        (use-local-map neo-scope-panel-map)
         (add-hook 'kill-buffer-hook #'neo-scope--preview-killed nil t)
         (set-buffer-modified-p nil)))))
 
@@ -683,7 +684,7 @@ to cancel its process.  Existing text buffers remain unchanged."
                  (let ((inhibit-read-only t)) (erase-buffer) (insert (error-message-string err))))))
       (when (window-live-p (neo-scope--state-preview-window s))
         (with-current-buffer buffer
-          (use-local-map neo-scope-input-map)
+          (use-local-map neo-scope-panel-map)
           (setq-local buffer-read-only t))
         (set-window-point (neo-scope--state-preview-window s) (with-current-buffer buffer (point)))
         (with-selected-window (neo-scope--state-preview-window s) (recenter))))))
@@ -714,11 +715,16 @@ to cancel its process.  Existing text buffers remain unchanged."
 
 (defun neo-scope-history-next () "Insert the next query." (interactive) (neo-scope-history-previous t))
 
-(defun neo-scope--close (s &optional no-focus)
+(defun neo-scope--buffer-killed ()
+  "Close the entire finder when any of its buffers is killed."
+  (when neo-scope--owner
+    (neo-scope--close neo-scope--owner nil (current-buffer))))
+
+(defun neo-scope--close (s &optional no-focus killing-buffer)
   (unless (neo-scope--state-closed s)
     (setf (neo-scope--state-closed s) t)
     (when (eq s neo-scope--session) (setq neo-scope--session nil))
-    (neo-scope--stop-preview (neo-scope--state-preview s))
+    (ignore-errors (neo-scope--stop-preview (neo-scope--state-preview s)))
     (dolist (timer (list (neo-scope--state-query-timer s) (neo-scope--state-match-timer s)
                         (neo-scope--state-preview-timer s))) (neo-scope--cancel-timer timer))
     (when (neo-scope--state-cancel s) (ignore-errors (funcall (neo-scope--state-cancel s))))
@@ -727,10 +733,12 @@ to cancel its process.  Existing text buffers remain unchanged."
     (when (buffer-live-p (neo-scope--state-input s))
       (let ((query (with-current-buffer (neo-scope--state-input s) (buffer-string))))
         (unless (string-empty-p query) (add-to-history 'neo-scope-history query))))
-    (when (frame-live-p (neo-scope--state-frame s)) (delete-frame (neo-scope--state-frame s) t))
+    (when (and (not no-focus) (frame-live-p (neo-scope--state-parent s))
+               (window-configuration-p (neo-scope--state-window-config s)))
+      (set-window-configuration (neo-scope--state-window-config s)))
     (dolist (buffer (list (neo-scope--state-input s) (neo-scope--state-candidates s)
                           (neo-scope--state-preview s)))
-      (when (buffer-live-p buffer)
+      (when (and (buffer-live-p buffer) (not (eq buffer killing-buffer)))
         (with-current-buffer buffer (set-buffer-modified-p nil)) (kill-buffer buffer)))
     (unless no-focus
       (when (frame-live-p (neo-scope--state-parent s))
@@ -762,10 +770,19 @@ to cancel its process.  Existing text buffers remain unchanged."
     (define-key map (kbd "RET") #'neo-scope-accept)
     (define-key map (kbd "C-g") #'neo-scope-cancel)
     (define-key map (kbd "<escape>") #'neo-scope-cancel)
+    (define-key map [remap quit-window] #'neo-scope-cancel)
+    (define-key map [remap keyboard-quit] #'neo-scope-cancel)
     (define-key map (kbd "M-p") #'neo-scope-history-previous)
     (define-key map (kbd "M-n") #'neo-scope-history-next)
     map)
   "Keymap for the query buffer; unbound keys retain normal Emacs editing.")
+
+(defvar neo-scope-panel-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map neo-scope-input-map)
+    (define-key map (kbd "q") #'neo-scope-cancel)
+    map)
+  "Keymap for read-only panels.")
 
 (defun neo-scope--frame-deleted (frame)
   (when-let* ((s neo-scope--session))
@@ -775,9 +792,7 @@ to cancel its process.  Existing text buffers remain unchanged."
       (neo-scope--close s t))))
 
 (defun neo-scope--dimensions (parent)
-  (let ((ratio (max 0.2 (min 1.0 neo-scope-frame-ratio))))
-    (cons (max 1 (floor (* ratio (frame-width parent))))
-          (max 1 (floor (* ratio (frame-height parent)))))))
+  (cons (frame-width parent) (frame-height parent)))
 
 (defun neo-scope--parent-resized (parent)
   (when-let* ((s neo-scope--session))
@@ -785,13 +800,11 @@ to cancel its process.  Existing text buffers remain unchanged."
                (frame-live-p (neo-scope--state-frame s)))
       (let ((size (neo-scope--dimensions parent)))
         (if (or (< (car size) 30) (< (cdr size) 8)) (neo-scope--close s)
-          (set-frame-size (neo-scope--state-frame s) (car size) (cdr size))
-          (modify-frame-parameters (neo-scope--state-frame s) '((left . 0.5) (top . 0.5)))
           (neo-scope--render s))))))
 
 ;;;###autoload
 (defun neo-scope-open (source)
-  "Open floating SOURCE, a plist with :name and :start.
+  "Open SOURCE in the current frame, a plist with :name and :start.
 :start is called with (QUERY EMIT) and returns a cancellation function.
 EMIT accepts (EVENT PAYLOAD): add supplies a list of candidate plists;
 done finishes enumeration; status and error supply a string.  Candidates
@@ -804,32 +817,28 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
     (user-error "Source needs :name and :start"))
   (when neo-scope--session (neo-scope--close neo-scope--session))
   (let* ((parent (selected-frame)) (size (neo-scope--dimensions parent))
-         (s (neo-scope--make-state :source source :parent parent :origin (selected-window))))
+         (s (neo-scope--make-state :source source :parent parent :frame parent
+                                   :window-config (current-window-configuration)
+                                   :origin (selected-window))))
     (when (or (< (car size) 30) (< (cdr size) 8)) (user-error "Frame is too small for neo-scope"))
     (setq neo-scope--session s)
     (condition-case err
         (progn
-          (setf (neo-scope--state-input s) (generate-new-buffer " *neo-scope-input*")
+          (setf (neo-scope--state-input s) (generate-new-buffer "*neo-scope*")
                 (neo-scope--state-candidates s) (generate-new-buffer " *neo-scope-candidates*")
                 (neo-scope--state-preview s) (generate-new-buffer " *neo-scope-preview*"))
           (dolist (buffer (list (neo-scope--state-input s) (neo-scope--state-candidates s)
                                 (neo-scope--state-preview s)))
             (with-current-buffer buffer
+              (setq-local neo-scope--owner s)
+              (add-hook 'kill-buffer-hook #'neo-scope--buffer-killed nil t)
               (setq-local mode-line-format nil truncate-lines t cursor-type nil
                           header-line-format " " buffer-read-only t)
-              (use-local-map neo-scope-input-map)))
+              (use-local-map neo-scope-panel-map)))
           (with-current-buffer (neo-scope--state-input s)
             (setq-local buffer-read-only nil cursor-type 'bar neo-scope--owner s)
             (use-local-map neo-scope-input-map)
             (add-hook 'after-change-functions #'neo-scope--input-changed nil t))
-          (setf (neo-scope--state-frame s)
-                (make-frame `((parent-frame . ,parent) (minibuffer . nil)
-                              (name . "neo-scope") (undecorated . t) (visibility . nil)
-                              (width . ,(car size)) (height . ,(cdr size))
-                              (left . 0.5) (top . 0.5) (internal-border-width . 1)
-                              (menu-bar-lines . 0) (tool-bar-lines . 0) (tab-bar-lines . 0)
-                              (vertical-scroll-bars . nil) (horizontal-scroll-bars . nil)
-                              (no-other-frame . t) (desktop-dont-save . t))))
           (with-selected-frame (neo-scope--state-frame s)
             (delete-other-windows)
             (let* ((left (selected-window))
@@ -846,8 +855,6 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
               (select-window input)))
           (add-hook 'delete-frame-functions #'neo-scope--frame-deleted)
           (add-hook 'window-size-change-functions #'neo-scope--parent-resized)
-          (make-frame-visible (neo-scope--state-frame s))
-          (select-frame-set-input-focus (neo-scope--state-frame s))
           (neo-scope--start-source s)
           (neo-scope--render s)
           s)
