@@ -97,15 +97,20 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
   preview-timer preview-key all tail ids pending ranked matches (selection 0)
   (revision 0) (history-index -1) (draft "") status done closed accept-pending render-key matched-matcher)
 
+(defun neo-scope--fuzzy-query (query)
+  "Normalize QUERY for fuzzy matching, ignoring input whitespace."
+  (downcase (replace-regexp-in-string "[[:space:]　]+" "" query)))
+
 (defun neo-scope-fuzzy-match (query candidate)
   "Match QUERY against CANDIDATE, returning (SCORE . POSITIONS), or nil.
 CANDIDATE is a plist with :id, :label, :match and :value.  Matching is a
-case-insensitive subsequence; contiguous and boundary matches score higher."
+case-insensitive subsequence ignoring query whitespace; contiguous and
+boundary matches score higher."
   (let* ((text (downcase (or (plist-get candidate :match)
                              (plist-get candidate :label))))
          (letters (or (and (equal query (car neo-scope--fuzzy-query-cache))
                            (cdr neo-scope--fuzzy-query-cache))
-                      (vconcat (mapcar #'char-to-string (downcase query)))))
+                      (vconcat (mapcar #'char-to-string (neo-scope--fuzzy-query query)))))
          (at 0) (last -2) (score 0) positions
          (base (or (string-match "/[^/]*\\'" text) -1)))
     (catch 'miss
@@ -725,7 +730,8 @@ to cancel its process.  Existing text buffers remain unchanged."
                      (eq (neo-scope--state-matched-matcher s) #'neo-scope-fuzzy-match)
                      (neo-scope--state-done s) (not (neo-scope--state-pending s))
                      (not (string-empty-p previous))
-                     (string-prefix-p (downcase previous) (downcase query)))
+                     (string-prefix-p (neo-scope--fuzzy-query previous)
+                                      (neo-scope--fuzzy-query query)))
             (let ((ids (make-hash-table :test 'equal)))
               (seq-doseq (row (neo-scope--state-matches s))
                 (puthash (plist-get (car row) :id) t ids))
@@ -1043,6 +1049,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
   "Match CANDIDATES, compiling Orderless once per batch instead of per item."
   (when (and (eq matcher #'neo-scope-orderless-match) (not (require 'orderless nil t)))
     (setq matcher #'neo-scope-fuzzy-match))
+  (when (eq matcher #'neo-scope-fuzzy-match) (setq query (neo-scope--fuzzy-query query)))
   (if (and (string-empty-p query)
            (or (eq matcher #'neo-scope-fuzzy-match)
                (and (eq matcher #'neo-scope-orderless-match)
@@ -1175,6 +1182,20 @@ Consult settings determine regexps, case handling and command arguments."
       (setq done t)
       (when cancel (funcall cancel)))))
 
+(defun neo-scope--fuzzy-completions (string table pred _point)
+  "Complete STRING using the same whitespace-insensitive fuzzy matcher."
+  (let* ((names (all-completions "" table pred))
+         (candidates (mapcar (lambda (name) (list :label name)) names))
+         (rows (cl-stable-sort (neo-scope--match-candidates string candidates #'neo-scope-fuzzy-match)
+                               #'> :key #'cadr)))
+    (when rows
+    (nconc (mapcar (lambda (row)
+                     (let ((text (copy-sequence (plist-get (car row) :label))))
+                       (dolist (pos (cddr row))
+                         (add-face-text-property pos (1+ pos) 'neo-scope-match nil text))
+                       text)) rows)
+           0))))
+
 (defvar vertico--input)
 (declare-function vertico--exhibit "vertico" ())
 
@@ -1198,14 +1219,21 @@ Query-dependent sources restart after input changes in the same minibuffer."
            choices tail cancel query-timer refresh-timer buffer change-hook
            (generation 0) (alive t) (number 0) (input "") (was-enabled vertico-mode)
            (completion-styles-alist
+            (cons '(neo-scope-fuzzy
+                    (lambda (string _table _pred point) (cons string point))
+                    neo-scope--fuzzy-completions
+                    "Whitespace-insensitive fuzzy selection")
             (cons '(neo-scope-live
                     (lambda (string _table _pred point) (cons string point))
                     (lambda (_string table pred _point)
-                      (nconc (all-completions "" table pred) (list 0)))
-                    "Live search results") completion-styles-alist))
+                      (let ((candidates (all-completions "" table pred)))
+                        (when candidates (nconc candidates 0))))
+                    "Live search results") completion-styles-alist)))
            (completion-styles (cond (dependent '(neo-scope-live))
                                     ((and (eq neo-scope-matcher #'neo-scope-orderless-match)
                                           (require 'orderless nil t)) '(orderless basic))
+                                    ((memq neo-scope-matcher '(neo-scope-fuzzy-match neo-scope-orderless-match))
+                                     '(neo-scope-fuzzy))
                                     (t completion-styles)))
            (completion-category-overrides
             (cons `(neo-scope (styles . ,completion-styles)) completion-category-overrides)))

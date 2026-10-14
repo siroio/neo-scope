@@ -32,6 +32,12 @@
       (neo-scope-vertico-open source))
     (scope-integration-check (= scope-integration-chosen 2) "Vertico RET selects candidate")
     (scope-integration-check (not vertico-mode) "Vertico mode restored")
+    (let ((neo-scope-matcher #'neo-scope-fuzzy-match))
+      (setq scope-integration-chosen nil)
+      (minibuffer-with-setup-hook
+          (lambda () (insert "be ta") (setq unread-command-events (list ?\r)))
+        (neo-scope-vertico-open source))
+      (scope-integration-check (= scope-integration-chosen 2) "Vertico fuzzy ignores input spaces"))
     (setq scope-integration-chosen nil)
     (minibuffer-with-setup-hook
         (lambda () (setq unread-command-events (list ?\C-g)))

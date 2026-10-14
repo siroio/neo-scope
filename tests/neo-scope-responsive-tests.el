@@ -2,6 +2,25 @@
 (require 'ert)
 (require 'neo-scope)
 
+(ert-deftest neo-scope-fuzzy-ignores-query-whitespace ()
+  (let ((c '(:id 1 :label "neo-scope.el")))
+    (dolist (query '("neo scope" "  neo   scope " "neo　scope" "neo\tscope"))
+      (should (equal (neo-scope-fuzzy-match query c) (neo-scope-fuzzy-match "neoscope" c)))
+      (should (equal (neo-scope--match-candidates query (list c) #'neo-scope-fuzzy-match)
+                     (neo-scope--match-candidates "neoscope" (list c) #'neo-scope-fuzzy-match))))
+    (should (equal (neo-scope--match-candidates " 　\t" (list c) #'neo-scope-fuzzy-match)
+                   (list (cons c '(0)))))))
+
+(ert-deftest neo-scope-fuzzy-completion-ignores-spaces ()
+  (let* ((completion-styles '(neo-scope-fuzzy))
+         (completion-styles-alist
+          (cons '(neo-scope-fuzzy
+                  (lambda (string _table _pred point) (cons string point))
+                  neo-scope--fuzzy-completions "Fuzzy") completion-styles-alist))
+         (result (completion-all-completions "neo scope" '("neo-scope.el" "other.el") nil 9)))
+    (should (equal (substring-no-properties (car result)) "neo-scope.el"))
+    (should (equal (cdr result) 0))))
+
 (ert-deftest neo-scope-fuzzy-original-scores-preserved ()
   (dolist (example '(("ab" "dir/alpha-beta.el" (39 4 10))
                      ("日本" "設定/日本語.el" (49 3 4))
@@ -20,7 +39,7 @@
                                   :candidates (generate-new-buffer "output"))))
     (setq neo-scope--session s)
     (unwind-protect
-        (dolist (query '("a" "ab" "a" "z" "" "日" "日本"))
+        (dolist (query '("a" "a b" "a　b" "a " "ab" "a" "z" "" "日" "日 本" "日本"))
           (with-current-buffer (neo-scope--state-input s) (erase-buffer) (insert query))
           (neo-scope--query s)
           (while (neo-scope--state-pending s)

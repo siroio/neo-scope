@@ -27,7 +27,7 @@
         (neo-scope-gui-check (= 2 (length (neo-scope--state-matches s))) "initial results")
         (select-window (neo-scope--state-input-window s))
         (neo-scope-gui-check (eq evil-state 'emacs) "query accepts immediate typing under Evil")
-        (execute-kbd-macro "beta")
+        (execute-kbd-macro "be ta")
         (run-at-time 0.6 nil #'neo-scope-gui-step-3))
     (error (neo-scope-gui-fail err))))
 (defun neo-scope-gui-step-3 ()
