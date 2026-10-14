@@ -78,6 +78,7 @@
     (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt table &rest _)
                  (should vertico-mode)
+                 (run-hooks 'minibuffer-setup-hook)
                  (should (equal (all-completions "" table) '("same [1]" "same [2]")))
                  "same [2]")))
       (neo-scope-vertico-open

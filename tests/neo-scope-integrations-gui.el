@@ -45,6 +45,35 @@
         (scope-integration-check (= 2 (plist-get (plist-get (neo-scope--selected s) :value) :line)) "Consult result line")
         (neo-scope-cancel)
         (scope-integration-vertico)
+        (let ((source (neo-scope-consult-file-source (expand-file-name "build/integration-gui") t)))
+          (setq source (plist-put source :action
+                                  (lambda (c) (setq scope-integration-chosen
+                                                    (plist-get (plist-get c :value) :line)))))
+          (setq scope-integration-chosen nil)
+          (minibuffer-with-setup-hook
+              (lambda ()
+                (insert "alpha")
+                (run-at-time 0.05 nil
+                             (lambda ()
+                               (with-current-buffer (window-buffer (active-minibuffer-window))
+                                 (let ((this-command 'self-insert-command))
+                                   (goto-char (point-max)) (insert ".*beta")))))
+                (run-at-time
+                 0.8 nil
+                 (lambda ()
+                   (condition-case err
+                       (with-current-buffer (window-buffer (active-minibuffer-window))
+                         (let ((deadline (+ (float-time) 5)))
+                           (while (and (null (all-completions "" minibuffer-completion-table))
+                                       (< (float-time) deadline))
+                             (accept-process-output nil 0.02)))
+                         (scope-integration-check
+                          (= 1 (length (all-completions "" minibuffer-completion-table)))
+                          "live Consult results in one Vertico minibuffer")
+                         (setq unread-command-events (list ?\r)))
+                     (error (scope-integration-fail err))))))
+            (neo-scope-vertico-open source))
+          (scope-integration-check (= scope-integration-chosen 2) "live Vertico grep RET action"))
         (write-region "INTEGRATIONS GUI COMPLETE\n" nil scope-integration-log t 'silent)
         (kill-emacs 0))
     ((error quit) (scope-integration-fail err))))
@@ -55,7 +84,7 @@
         (neo-scope-cancel)
         (let ((root (expand-file-name "build/integration-gui")))
           (make-directory root t)
-          (with-temp-file (expand-file-name "日本.txt" root) (insert "first\nalpha beta\n"))
+          (with-temp-file (expand-file-name "日本.txt" root) (insert "first\nalpha beta\nalpha gamma\n"))
           (neo-scope-open (neo-scope-consult-file-source root t))
           (with-current-buffer (neo-scope--state-input neo-scope--session) (insert "alpha.*beta")))
         (run-at-time 1 nil #'scope-integration-consult))
