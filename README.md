@@ -112,13 +112,45 @@ PNG/JPEG/GIF/WebP/BMP/TIFF/SVG/AVIF/ICO等の画像を振り分け、実際に�
 
 マッチャー `(QUERY CANDIDATE)` は非一致ならnil、一致なら `(SCORE . POSITIONS)` を返します。POSITIONSは0始まりの文字位置で、`:label` と `:match` が同じなら強調に使います。スコア降順、同点は取得順を維持します。プレビュー関数 `(CANDIDATE BUFFER)` は指定バッファへ描画し、確定関数 `(CANDIDATE)` はFinderを閉じた後に呼ばれます。
 
-Orderless・Consult・Vertico用の専用アダプターは未実装です。交換APIを使用して後から追加でき、本体に依存を持ち込みません。
+## Consult・Orderless・Verticoとの任意連携
+
+各パッケージは必要な機能を呼ぶときだけ読み込みます。自動インストールはしません。未導入の場合は自作の検索・照合・表示へ戻ります。
+
+neo-scopeの画面を維持し、Orderlessによる照合とConsultのripgrepを利用する設定です。
+
+```elisp
+(use-package neo-scope
+  :vc (:url "https://github.com/siroio/neo-scope" :rev :newest)
+  :commands (neo-scope-find-file neo-scope-buffer neo-scope-grep)
+  :custom
+  (neo-scope-list-ratio 0.4)
+  (neo-scope-matcher #'neo-scope-orderless-match)
+  (neo-scope-file-source-function #'neo-scope-consult-file-source))
+```
+
+- **Orderless**: ファイル・バッファ検索を複数単語で絞り込みます。`beta alpha` は `alpha beta` に一致し、日本語、設定済みのmatching styles・dispatchers・大文字小文字設定も使用します。スコアは同点として取得順を維持します。
+- **Consult**: `neo-scope-grep` の候補取得をConsultのripgrepへ交換します。`rg` が必要です。`consult-ripgrep-args`、正規表現の生成とcase設定を使用し、ファイルと行番号をneo-scopeのプレビュー・確定処理へ渡します。通常のファイル一覧取得は自作処理です。grepの検索語はConsultが処理するため、結果をOrderlessで再照合しません。
+- **Vertico**: 同じ3コマンドの選択画面をミニバッファへ変更できます。
+
+```elisp
+;; Verticoで選ぶモード。neo-scopeの:customに追加できます。
+(setq neo-scope-display-function #'neo-scope-vertico-open)
+
+;; neo-scopeの候補・プレビュー画面に戻す
+(setq neo-scope-display-function #'neo-scope-open)
+```
+
+Verticoモードでは候補を収集してから選択します。grepは「検索語入力 → 検索結果を選択」の2段階で、選択中の検索プロセス再起動やneo-scopeのプレビュー画面は使用しません。候補ラベルには識別番号を付け、同名の候補も別々に選べます。照合は通常のcompletion設定を使用し、Orderless連携を選択済みならこの選択中だけOrderlessを使用します。Verticoが無効なら選択中だけ有効にし、取消・エラー時も元の有効状態へ戻します。
+
+収集は `neo-scope-collection-timeout`（既定30秒）で打ち切り、C-g・エラー・終了時にソースを中止します。Consult連携は候補取得専用の安定した公開APIがないため内部のbuilder・process APIをこのアダプター内で利用します。API未提供またはConsult/rg未導入なら自作grepへ戻ります。内部APIの将来変更には追従が必要です。プロセス失敗とrgの「一致なし」はどちらも終了扱いとし、診断先 `*consult-async*` を状態欄に表示します。
+
+既存の `consult-*` コマンドやグローバルのcompletion設定は変更しません。
 
 ## 制限
 
-- 端末・TRAMP検索には対応していません。子フレームを表示できるGUIが必要です。
-- `.gitignore` は解釈しません。除外ディレクトリの設定を使用し、シンボリックリンクは追跡しません。
-- grepは保存済みのファイル内容を検索します。正規表現検索ではありません。
+- 自作画面はGUI専用です。Verticoモードは通常のミニバッファを使用します。TRAMP検索には対応していません。
+- 自作ソースは `.gitignore` を解釈しません。除外ディレクトリの設定を使用し、シンボリックリンクは追跡しません。Consultのripgrepソースはrgの設定に従います。
+- grepは保存済みのファイル内容を検索します。自作ソースはリテラル文字列、Consultソースは正規表現検索です。
 - grepではバイナリ・サイズ上限超過・読込失敗をスキップし、件数を表示します。候補上限に達した場合も表示します。プレビューでは基本情報を残して、本文や詳細を表示できない理由を示します。
 - 処理はタイマーで分割しますが、並列I/Oではありません。巨大ディレクトリの列挙や遅いドライブは同期I/Oの待ち時間が残ります。
 - 起動中のFinderは1つです。再起動時には前のセッションを閉じます。
@@ -135,6 +167,8 @@ emacs -Q --batch -l tests/neo-scope-package.el
 GUIテストは独立したEmacsで `-Q -l tests/neo-scope-gui.el` を指定します。テストはそのEmacsプロセスを終了します。先に `build` ディレクトリを作成してください。[検証結果](docs/verification.md)を参照してください。
 
 メディアの実機テストとfixture生成手順は[メディア検証記録](docs/media-verification.md)を参照してください。
+
+任意連携の実パッケージ・GUI検証は[連携検証記録](docs/integrations-verification.md)を参照してください。
 
 ## 設計
 

@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 neo-scope contributors
 ;; Author: neo-scope contributors
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, files, matching
 ;; URL: https://github.com/siroio/neo-scope
@@ -55,6 +55,18 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (defcustom neo-scope-file-source-function #'neo-scope-file-source
   "Factory accepting ROOT and optional GREP and returning a source plist."
   :type 'function)
+(defcustom neo-scope-display-function #'neo-scope-open
+  "Function displaying a source.  Use `neo-scope-vertico-open' for Vertico."
+  :type 'function)
+(defcustom neo-scope-collection-timeout 30
+  "Maximum seconds to collect candidates for the minibuffer frontend."
+  :type 'number)
+(declare-function orderless-all-completions "orderless" (string table pred point))
+(declare-function vertico-mode "vertico" (&optional arg))
+(declare-function consult--ripgrep-make-builder "consult" (paths))
+(declare-function consult--async-process "consult" (builder &rest props))
+(defvar consult--grep-match-regexp)
+(defvar vertico-mode)
 (defface neo-scope-selection '((t :inherit highlight)) "Selected candidate.")
 (defface neo-scope-match '((t :inherit match)) "Matched characters.")
 (defface neo-scope-title '((t :inherit font-lock-keyword-face :weight bold))
@@ -864,17 +876,159 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
 (defun neo-scope-find-file (&optional choose)
   "Find a project file.  With prefix CHOOSE, prompt for a root directory."
   (interactive "P")
-  (neo-scope-open (funcall neo-scope-file-source-function (neo-scope--root choose))))
+  (funcall neo-scope-display-function
+           (funcall neo-scope-file-source-function (neo-scope--root choose))))
 
 ;;;###autoload
 (defun neo-scope-buffer () "Select a live buffer." (interactive)
-  (neo-scope-open (neo-scope-buffer-source)))
+  (funcall neo-scope-display-function (neo-scope-buffer-source)))
 
 ;;;###autoload
 (defun neo-scope-grep (&optional choose)
   "Search literal text in the project.  With prefix CHOOSE, choose a root."
   (interactive "P")
-  (neo-scope-open (funcall neo-scope-file-source-function (neo-scope--root choose) t)))
+  (funcall neo-scope-display-function
+           (funcall neo-scope-file-source-function (neo-scope--root choose) t)))
+
+(defun neo-scope-orderless-match (query candidate)
+  "Match QUERY with Orderless, or use fuzzy matching if unavailable.
+Honor Orderless styles, dispatchers and case settings.  Preserve source order."
+  (if (not (require 'orderless nil t)) (neo-scope-fuzzy-match query candidate)
+    (let* ((text (or (plist-get candidate :match) (plist-get candidate :label)))
+           (completion-lazy-hilit nil)
+           (matched (condition-case nil
+                        (car (orderless-all-completions query (list text) nil (length query)))
+                      (invalid-regexp nil)))
+           positions)
+      (when matched
+        (dotimes (i (length matched))
+          (when (get-text-property i 'face matched) (push i positions)))
+        (cons 0 (nreverse positions))))))
+
+(defun neo-scope--consult-candidate (line root)
+  "Convert one raw Consult grep LINE to a candidate relative to ROOT."
+  (when (string-match consult--grep-match-regexp line)
+    (let ((file (expand-file-name (match-string 1 line) root))
+          (number (string-to-number (match-string 2 line)))
+          (text (substring line (match-end 0))))
+      (neo-scope--file-candidate file root number text))))
+
+(defun neo-scope-consult-file-source (root &optional grep)
+  "Use Consult ripgrep for GREP, otherwise the built-in file source.
+Missing Consult, unsupported internals or missing rg use the built-in source.
+Consult settings determine regexps, case handling and command arguments."
+  (setq root (neo-scope--local-root root))
+  (if (not (and grep (require 'consult nil t)
+                (fboundp 'consult--ripgrep-make-builder)
+                (fboundp 'consult--async-process)
+                (boundp 'consult--grep-match-regexp) (executable-find "rg")))
+      (neo-scope-file-source root grep)
+    (list
+     :name "Consult ripgrep" :query-dependent t
+     ;; Consult has already applied the search query to the file contents.
+     :matcher (lambda (_query _candidate) '(0))
+     :start
+     (lambda (query emit)
+       (if (string-empty-p query)
+           (progn (funcall emit 'done nil) #'ignore)
+         (let* ((default-directory root) (stopped nil) (count 0) async
+                (builder (consult--ripgrep-make-builder '("."))))
+           ;; Private API is confined here: use the process stage without
+           ;; Consult's minibuffer hooks, throttling or global size changes.
+           (setq async
+                 (funcall
+                  (consult--async-process builder :coding 'utf-8-unix)
+                  (lambda (event)
+                    (unless stopped
+                      (cond
+                       ((consp event)
+                        (let (batch)
+                          (dolist (line event)
+                            (when (< count neo-scope-max-results)
+                              (when-let* ((candidate (neo-scope--consult-candidate line root)))
+                                (cl-incf count) (push candidate batch))))
+                          (when batch (funcall emit 'add (nreverse batch)))
+                          (when (>= count neo-scope-max-results)
+                            (setq stopped t)
+                            (funcall emit 'status "Result limit reached.")
+                            (funcall emit 'done nil)
+                            (funcall async 'cancel))))
+                       ((equal event [indicator finished]) (funcall emit 'done nil))
+                       ((equal event [indicator failed])
+                        ;; rg also uses exit status 1 for no matches.
+                        (funcall emit 'status "No matches or process failure; see *consult-async*")
+                        (funcall emit 'done nil)))))))
+           (condition-case err
+               (if (funcall builder query) (funcall async query)
+                 (funcall emit 'error "Invalid Consult search expression"))
+             (error (funcall async 'destroy) (signal (car err) (cdr err))))
+           (lambda () (setq stopped t) (funcall async 'destroy))))))))
+
+(defun neo-scope--collect (source query)
+  "Collect SOURCE for QUERY, cancelling it on exit, error or timeout."
+  (let ((deadline (+ (float-time) neo-scope-collection-timeout))
+        (ids (make-hash-table :test 'equal)) items done failure cancel)
+    (unwind-protect
+        (progn
+          (setq cancel
+                (funcall (plist-get source :start) query
+                         (lambda (event payload)
+                           (pcase event
+                             ('add (dolist (candidate payload)
+                                     (when (and (< (hash-table-count ids) neo-scope-max-results)
+                                                (not (gethash (plist-get candidate :id) ids)))
+                                       (puthash (plist-get candidate :id) t ids)
+                                       (push candidate items))))
+                             ('done (setq done t))
+                             ('error (setq failure payload done t))))))
+          (while (and (not done) (< (float-time) deadline))
+            (accept-process-output nil 0.02))
+          (unless done (user-error "Candidate collection timed out"))
+          (when failure (user-error "%s" failure))
+          (nreverse items))
+      (setq done t)
+      (when cancel (funcall cancel)))))
+
+;;;###autoload
+(defun neo-scope-vertico-open (source)
+  "Select SOURCE using Vertico instead of the neo-scope screen.
+Query-dependent sources ask for a search query before collecting results.
+The result selection uses the user's normal completion styles."
+  (if (not (require 'vertico nil t))
+      (neo-scope-open source)
+    (when neo-scope--session (neo-scope--close neo-scope--session))
+    (let* ((query (if (plist-get source :query-dependent)
+                      (read-string (concat (plist-get source :name) " query: ") nil
+                                   'neo-scope-history) ""))
+           (items (neo-scope--collect source query))
+           (counts (make-hash-table :test 'equal)) choices
+           (was-enabled vertico-mode)
+           (completion-styles (if (and (eq neo-scope-matcher #'neo-scope-orderless-match)
+                                        (require 'orderless nil t))
+                                  '(orderless basic) completion-styles))
+           (completion-category-overrides
+            (cons '(neo-scope (styles . nil)) completion-category-overrides)))
+      (unless items (user-error "No candidates"))
+      (cl-loop for candidate in items for i from 1 do
+               (let* ((label (plist-get candidate :label))
+                      (name (format "%s [%d]" label i)))
+                 (puthash name candidate counts)
+                 (push name choices)))
+      (setq choices (nreverse choices))
+      (unwind-protect
+          (progn
+            (unless was-enabled (vertico-mode 1))
+            (let* ((table (lambda (string pred action)
+                            (if (eq action 'metadata)
+                                '(metadata (category . neo-scope)
+                                           (display-sort-function . identity)
+                                           (cycle-sort-function . identity))
+                              (complete-with-action action choices string pred))))
+                   (selected (completing-read (concat (plist-get source :name) ": ")
+                                              table nil t)))
+              (funcall (or (plist-get source :action) #'neo-scope-action)
+                       (gethash selected counts))))
+        (unless was-enabled (vertico-mode -1))))))
 
 (provide 'neo-scope)
 ;;; neo-scope.el ends here
