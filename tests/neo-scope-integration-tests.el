@@ -7,6 +7,7 @@
   (let* ((orderless-matching-styles '(orderless-literal))
          (c '(:id 1 :label "alpha beta 日本" :match "alpha beta 日本")))
     (should (neo-scope-orderless-match "beta alpha" c))
+    (should (neo-scope-orderless-match "beta　alpha" c))
     (should (neo-scope-orderless-match "日本 alpha" c))
     (should-not (neo-scope-orderless-match "alpha missing" c))
     (should (equal (cdr (neo-scope-orderless-match "beta" c)) '(6 7 8 9)))))
@@ -35,6 +36,7 @@
             (should (= 2 (plist-get (plist-get (car candidates) :value) :line)))
             (should (equal (plist-get (plist-get (car candidates) :value) :file)
                            (expand-file-name "日本 file.txt" root)))
+            (should (= 1 (length (neo-scope--collect source "beta　alpha"))))
             (should-not (neo-scope--collect source "no-such-text"))))
       (delete-directory root t))))
 

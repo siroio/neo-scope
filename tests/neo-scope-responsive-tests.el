@@ -2,12 +2,12 @@
 (require 'ert)
 (require 'neo-scope)
 
-(ert-deftest neo-scope-fuzzy-ignores-query-whitespace ()
+(ert-deftest neo-scope-fuzzy-whitespace-separates-unordered-words ()
   (let ((c '(:id 1 :label "neo-scope.el")))
-    (dolist (query '("neo scope" "  neo   scope " "neo　scope" "neo\tscope"))
-      (should (equal (neo-scope-fuzzy-match query c) (neo-scope-fuzzy-match "neoscope" c)))
+    (dolist (query '("neo scope" "scope neo" "  neo   scope " "scope　neo" "neo\tscope"))
+      (should (equal (neo-scope-fuzzy-match query c) (neo-scope-fuzzy-match "neo scope" c)))
       (should (equal (neo-scope--match-candidates query (list c) #'neo-scope-fuzzy-match)
-                     (neo-scope--match-candidates "neoscope" (list c) #'neo-scope-fuzzy-match))))
+                     (neo-scope--match-candidates "neo scope" (list c) #'neo-scope-fuzzy-match))))
     (should (equal (neo-scope--match-candidates " 　\t" (list c) #'neo-scope-fuzzy-match)
                    (list (cons c '(0)))))))
 
@@ -17,7 +17,7 @@
           (cons '(neo-scope-fuzzy
                   (lambda (string _table _pred point) (cons string point))
                   neo-scope--fuzzy-completions "Fuzzy") completion-styles-alist))
-         (result (completion-all-completions "neo scope" '("neo-scope.el" "other.el") nil 9)))
+         (result (completion-all-completions "scope neo" '("neo-scope.el" "other.el") nil 9)))
     (should (equal (substring-no-properties (car result)) "neo-scope.el"))
     (should (equal (cdr result) 0))))
 
@@ -39,7 +39,7 @@
                                   :candidates (generate-new-buffer "output"))))
     (setq neo-scope--session s)
     (unwind-protect
-        (dolist (query '("a" "a b" "a　b" "a " "ab" "a" "z" "" "日" "日 本" "日本"))
+        (dolist (query '("a" "ab" "a b" "b a" "b ab" "a　b" "a " "ab" "a" "z" "" "日" "本 日" "日本"))
           (with-current-buffer (neo-scope--state-input s) (erase-buffer) (insert query))
           (neo-scope--query s)
           (while (neo-scope--state-pending s)
@@ -50,6 +50,46 @@
                            #'> :key #'cadr)))
             (should (equal (neo-scope--state-matches s) (vconcat expected)))))
       (neo-scope--close s))))
+
+(ert-deftest neo-scope-name-first-retains-path-and-match-faces ()
+  (let* ((c (neo-scope--file-candidate (expand-file-name "src/neo-scope.el") default-directory 12 "code/path"))
+         (display (neo-scope--candidate-label c '(0 1 2))))
+    (should (equal (substring-no-properties display) "neo-scope.el:12: code/path  src/"))
+    (should (memq 'neo-scope-filename (ensure-list (get-text-property 0 'face display))))
+    (should (memq 'neo-scope-match (get-text-property (- (length display) 4) 'face display)))
+    (should (equal (plist-get c :label) "src/neo-scope.el:12: code/path"))))
+
+(ert-deftest neo-scope-compact-preview-details-toggle ()
+  (let* ((source (generate-new-buffer "code")) (preview (generate-new-buffer "preview"))
+         (c (list :id 1 :label "code" :value (list :buffer source :line 2)))
+         (s (neo-scope--make-state :preview preview :matches (vector (cons c '(0))))))
+    (setq neo-scope--session s)
+    (unwind-protect
+        (progn
+          (with-current-buffer source (insert "first\nsecond\n"))
+          (with-current-buffer preview (setq neo-scope--owner s neo-scope--details nil))
+          (neo-scope--show-preview s)
+          (with-current-buffer preview (should-not (string-match-p "General" (buffer-string))))
+          (neo-scope-toggle-details)
+          (with-current-buffer preview
+            (should (string-match-p "General" (buffer-string)))
+            (should (looking-at "second")))
+          (neo-scope-toggle-details)
+          (with-current-buffer preview
+            (should-not (string-match-p "General" (buffer-string)))
+            (should (looking-at "second"))))
+      (neo-scope--close s) (kill-buffer source))))
+
+(ert-deftest neo-scope-grep-unordered-words ()
+  (let ((root (make-temp-file "scope-words" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "words.txt" root)
+            (insert "scope first neo\nneo then scope\nneo only\n"))
+          (let ((candidates (neo-scope--collect (neo-scope-file-source root t) "neo　scope")))
+            (should (= 2 (length candidates)))
+            (dolist (c candidates) (should (neo-scope-literal-match "scope neo" c)))))
+      (delete-directory root t))))
 
 (ert-deftest neo-scope-status-change-does-not-rewrite-candidates ()
   (let ((s (neo-scope--make-state :source '(:name "Test") :done t :matches []

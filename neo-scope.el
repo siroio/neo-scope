@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026 neo-scope contributors
 ;; Author: neo-scope contributors
-;; Version: 0.4.0
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, files, matching
 ;; URL: https://github.com/siroio/neo-scope
@@ -78,6 +78,7 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (defface neo-scope-match '((t :inherit match)) "Matched characters.")
 (defface neo-scope-title '((t :inherit font-lock-keyword-face :weight bold))
   "Panel titles.")
+(defface neo-scope-filename '((t :inherit default :weight bold)) "Candidate file names.")
 
 (defvar neo-scope-history nil "Queries entered in neo-scope.")
 (defvar neo-scope--session nil)
@@ -86,6 +87,8 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (defvar neo-scope--fuzzy-query-cache nil)
 (defvar-local neo-scope--owner nil)
 (defvar-local neo-scope--text-cache nil)
+(defvar-local neo-scope--details t)
+(put 'neo-scope--details 'permanent-local t)
 (put 'neo-scope--text-cache 'permanent-local t)
 (declare-function evil-emacs-state "evil" (&optional arg))
 (defvar evil-buffer-regexps)
@@ -97,23 +100,33 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
   preview-timer preview-key all tail ids pending ranked matches (selection 0)
   (revision 0) (history-index -1) (draft "") status done closed accept-pending render-key matched-matcher)
 
+(defun neo-scope--query-words (query)
+  "Split QUERY on whitespace, including full-width spaces."
+  (split-string query "[[:space:]　]+" t))
+
 (defun neo-scope--fuzzy-query (query)
-  "Normalize QUERY for fuzzy matching, ignoring input whitespace."
-  (downcase (replace-regexp-in-string "[[:space:]　]+" "" query)))
+  "Normalize QUERY while retaining word boundaries."
+  (mapconcat #'identity (neo-scope--query-words (downcase query)) " "))
+
+(defun neo-scope--fuzzy-components (query)
+  (mapcar (lambda (word) (vconcat (mapcar #'char-to-string word)))
+          (neo-scope--query-words (downcase query))))
 
 (defun neo-scope-fuzzy-match (query candidate)
   "Match QUERY against CANDIDATE, returning (SCORE . POSITIONS), or nil.
 CANDIDATE is a plist with :id, :label, :match and :value.  Matching is a
-case-insensitive subsequence ignoring query whitespace; contiguous and
-boundary matches score higher."
+case-insensitive subsequences for all whitespace-separated words in any
+order; contiguous and boundary matches score higher."
   (let* ((text (downcase (or (plist-get candidate :match)
                              (plist-get candidate :label))))
-         (letters (or (and (equal query (car neo-scope--fuzzy-query-cache))
+         (components (or (and (equal query (car neo-scope--fuzzy-query-cache))
                            (cdr neo-scope--fuzzy-query-cache))
-                      (vconcat (mapcar #'char-to-string (neo-scope--fuzzy-query query)))))
-         (at 0) (last -2) (score 0) positions
+                      (neo-scope--fuzzy-components query)))
+         (score 0) positions
          (base (or (string-match "/[^/]*\\'" text) -1)))
     (catch 'miss
+      (dolist (letters components)
+        (let ((at 0) (last -2))
       (dotimes (i (length letters))
         (let ((pos (string-search (aref letters i) text at)))
           (unless pos (throw 'miss nil))
@@ -124,8 +137,8 @@ boundary matches score higher."
                          (if (> pos base) 4 0)
                          (- (- pos at))))
           (push pos positions)
-          (setq last pos at (1+ pos))))
-      (cons score (nreverse positions)))))
+          (setq last pos at (1+ pos))))))
+      (cons score (delete-dups (sort positions #'<))))))
 
 (defun neo-scope--local-root (root)
   "Validate ROOT and return its absolute directory name."
@@ -134,15 +147,19 @@ boundary matches score higher."
   (file-name-as-directory (expand-file-name root)))
 
 (defun neo-scope-literal-match (query candidate)
-  "Return all literal QUERY match positions in CANDIDATE, without ranking."
-  (if (string-empty-p query) '(0)
-    (let ((text (or (plist-get candidate :match) (plist-get candidate :label)))
-          (case-fold-search t) (start 0) positions)
-      (while (string-match (regexp-quote query) text start)
-        (let ((begin (match-beginning 0)) (end (match-end 0)))
-          (cl-loop for i from begin below end do (push i positions))
-          (setq start end)))
-      (when positions (cons 0 (nreverse positions))))))
+  "Match all whitespace-separated literal words in QUERY in any order."
+  (let ((text (or (plist-get candidate :match) (plist-get candidate :label)))
+        (case-fold-search t) positions)
+    (catch 'miss
+      (dolist (word (neo-scope--query-words query))
+        (let ((start 0) found)
+          (while (string-match (regexp-quote word) text start)
+            (setq found t)
+            (let ((begin (match-beginning 0)) (end (match-end 0)))
+              (cl-loop for i from begin below end do (push i positions))
+              (setq start end)))
+          (unless found (throw 'miss nil))))
+      (cons 0 (delete-dups (sort positions #'<))))))
 
 (defun neo-scope--root (choose)
   (neo-scope--local-root
@@ -157,10 +174,24 @@ boundary matches score higher."
                             text t t))
 
 (defun neo-scope--file-candidate (file root &optional line text)
-  (let ((label (concat (neo-scope--label (file-relative-name file root))
-                       (when line (format ":%d: %s" line (neo-scope--label text))))))
+  (let* ((path (neo-scope--label (file-relative-name file root)))
+         (label (concat path (when line (format ":%d: %s" line (neo-scope--label text))))))
     (list :id (if line (cons file line) file) :label label :match label
+          :name-start (1+ (or (cl-position ?/ path :from-end t) -1)) :path-end (length path)
           :value (list :file file :line (or line 1)))))
+
+(defun neo-scope--candidate-label (candidate positions)
+  "Format CANDIDATE with its file name first, keeping match offsets correct."
+  (let* ((label (copy-sequence (plist-get candidate :label)))
+         (start (plist-get candidate :name-start)) (end (plist-get candidate :path-end)))
+    (when (equal label (or (plist-get candidate :match) label))
+      (dolist (pos positions)
+        (when (< pos (length label))
+          (add-face-text-property pos (1+ pos) 'neo-scope-match nil label))))
+    (if (not (and start end)) label
+      (add-face-text-property start end 'neo-scope-filename t label)
+      (when (> start 0) (add-face-text-property 0 start 'shadow t label))
+      (concat (substring label start) (when (> start 0) (concat "  " (substring label 0 start)))))))
 
 (defun neo-scope--read-text (file)
   "Read bounded local FILE, rejecting binary, remote and oversized files."
@@ -189,7 +220,8 @@ files are not interpreted.  No external executable is required."
    :matcher (when grep #'neo-scope-literal-match)
    :start
    (lambda (query emit)
-     (let ((queue (list root)) timer stopped (count 0) (skipped 0) limited)
+     (let ((queue (list root)) (words (neo-scope--query-words query))
+           timer stopped (count 0) (skipped 0) limited)
        (cl-labels
            ((finish ()
               (setq stopped t)
@@ -221,13 +253,15 @@ files are not interpreted.  No external executable is required."
                                   (goto-char (point-min))
                                   (let ((case-fold-search t) (line 1) (previous (point-min)))
                                     (while (and (< count neo-scope-max-results)
-                                                (search-forward query nil t))
+                                                (search-forward (car words) nil t))
                                       (let ((start (line-beginning-position)))
                                         (setq line (+ line (count-lines previous start)) previous start)
+                                        (when (neo-scope-literal-match
+                                               query (list :label (buffer-substring-no-properties start (line-end-position))))
                                         (push (neo-scope--file-candidate
                                                file root line
                                                (buffer-substring-no-properties start (line-end-position))) batch)
-                                        (cl-incf count)
+                                        (cl-incf count))
                                         (forward-line 1)))))))
                             (error (cl-incf skipped)))))
                       (when batch (funcall emit 'add (nreverse batch)))
@@ -235,7 +269,7 @@ files are not interpreted.  No external executable is required."
                       (if (or (null queue) limited) (finish)
                         (setq timer (run-at-time 0.01 nil #'tick))))
                   (error (setq stopped t) (funcall emit 'error (error-message-string err)))))))
-         (if (and grep (string-empty-p query))
+         (if (and grep (null words))
              (setq timer (run-at-time 0 nil (lambda () (unless stopped (finish)))))
            (setq timer (run-at-time 0 nil #'tick))))
        (lambda () (setq stopped t) (when (timerp timer) (cancel-timer timer)))))))
@@ -553,10 +587,17 @@ to cancel its process.  Existing text buffers remain unchanged."
          (media (member ext '("mp4" "mkv" "webm" "mov" "avi" "m4v" "mpeg" "mpg" "wmv"
                               "mp3" "wav" "flac" "ogg" "opus" "m4a" "aac" "wma" "aiff")))
          (picture (member ext '("png" "jpg" "jpeg" "gif" "webp" "bmp" "tif" "tiff" "svg" "avif" "ico")))
-         (token (list candidate)) general)
+         (token (list candidate)) general compact)
     (when (and file (file-remote-p file)) (user-error "Remote preview is not supported"))
     (setq source (or source (and file (get-file-buffer file))))
-    (setq general (neo-scope--general-info file source))
+    (setq compact (with-current-buffer buffer
+                    (and neo-scope--owner (not neo-scope--details) (not (or media picture)))))
+    (setq general
+          (if compact
+              (concat (propertize (neo-scope--label (if file (file-name-nondirectory file) (buffer-name source)))
+                                  'face 'neo-scope-filename)
+                      (when (and source (buffer-modified-p source)) "  [+]") "\n")
+            (neo-scope--general-info file source)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (fundamental-mode) (erase-buffer)
@@ -568,7 +609,8 @@ to cancel its process.  Existing text buffers remain unchanged."
                 (neo-scope--text-preview candidate buffer)
                 (let ((position (copy-marker (point) t)))
                   (goto-char (point-min))
-                  (insert general (neo-scope--heading "Content"))
+                  (insert general)
+                  (unless compact (insert (neo-scope--heading "Content")))
                   (goto-char position) (set-marker position nil)))
             (error (erase-buffer) (insert general (error-message-string err))))))
         (when picture
@@ -773,11 +815,7 @@ to cancel its process.  Existing text buffers remain unchanged."
           (cl-loop for i from start below (min total (+ start rows))
                    for row = (aref matches i) for candidate = (car row)
                    do (let* ((begin (point))
-                             (label (copy-sequence (plist-get candidate :label))))
-                        (when (equal label (or (plist-get candidate :match) label))
-                          (dolist (pos (cddr row))
-                            (when (< pos (length label))
-                              (add-face-text-property pos (1+ pos) 'neo-scope-match nil label))))
+                             (label (neo-scope--candidate-label candidate (cddr row))))
                         (insert (if (= i selected) "› " "  ") label "\n")
                         (when (= i selected)
                           (add-face-text-property begin (point) 'neo-scope-selection t))))
@@ -789,7 +827,7 @@ to cancel its process.  Existing text buffers remain unchanged."
       (when (window-live-p window) (set-window-start window 1)))
       (with-current-buffer (neo-scope--state-input s)
         (setq header-line-format
-              (format " Search  %d/%d%s  %s" (if (> total 0) (1+ selected) 0) total
+              (format " Search  %d/%d%s  RET:open  Esc:close  M-i:info  %s" (if (> total 0) (1+ selected) 0) total
                       (if (or (not (neo-scope--state-done s)) (neo-scope--state-pending s)) " …" "")
                       (or (neo-scope--state-status s) "")))))))
 
@@ -844,6 +882,13 @@ to cancel its process.  Existing text buffers remain unchanged."
       (neo-scope--render s) (neo-scope--schedule-preview s))))
 
 (defun neo-scope-previous () "Move to the previous candidate." (interactive) (neo-scope-next -1))
+
+(defun neo-scope-toggle-details ()
+  "Toggle detailed file information without leaving the query."
+  (interactive)
+  (when-let* ((s neo-scope--session) (buffer (neo-scope--state-preview s)))
+    (with-current-buffer buffer (setq neo-scope--details (not neo-scope--details)))
+    (neo-scope--show-preview s)))
 
 (defun neo-scope-preview-down ()
   "Scroll the preview down without leaving the query."
@@ -931,6 +976,7 @@ to cancel its process.  Existing text buffers remain unchanged."
     (define-key map (kbd "C-k") #'neo-scope-previous)
     (define-key map (kbd "C-v") #'neo-scope-preview-down)
     (define-key map (kbd "M-v") #'neo-scope-preview-up)
+    (define-key map (kbd "M-i") #'neo-scope-toggle-details)
     (define-key map (kbd "<down>") #'neo-scope-next)
     (define-key map (kbd "<up>") #'neo-scope-previous)
     (define-key map (kbd "RET") #'neo-scope-accept)
@@ -1003,9 +1049,11 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
                           header-line-format " " buffer-read-only t)
               (use-local-map neo-scope-panel-map)))
           (with-current-buffer (neo-scope--state-input s)
-            (setq-local buffer-read-only nil cursor-type 'bar neo-scope--owner s)
+            (setq-local buffer-read-only nil cursor-type 'bar neo-scope--owner s
+                        line-prefix (propertize "› " 'face 'neo-scope-title))
             (use-local-map neo-scope-input-map)
             (add-hook 'after-change-functions #'neo-scope--input-changed nil t))
+          (with-current-buffer (neo-scope--state-preview s) (setq neo-scope--details nil))
           (with-selected-frame (neo-scope--state-frame s)
             (delete-other-windows)
             (let* ((left (selected-window))
@@ -1020,6 +1068,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
               (set-window-buffer input (neo-scope--state-input s))
               (set-window-parameter input 'window-size-fixed 'height)
               (select-window input)))
+          (select-window (neo-scope--state-input-window s))
           (add-hook 'delete-frame-functions #'neo-scope--frame-deleted)
           (add-hook 'window-size-change-functions #'neo-scope--parent-resized)
           (neo-scope--start-source s)
@@ -1049,6 +1098,8 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
   "Match CANDIDATES, compiling Orderless once per batch instead of per item."
   (when (and (eq matcher #'neo-scope-orderless-match) (not (require 'orderless nil t)))
     (setq matcher #'neo-scope-fuzzy-match))
+  (when (eq matcher #'neo-scope-orderless-match)
+    (setq query (replace-regexp-in-string "[　\t\n\r]" " " query)))
   (when (eq matcher #'neo-scope-fuzzy-match) (setq query (neo-scope--fuzzy-query query)))
   (if (and (string-empty-p query)
            (or (eq matcher #'neo-scope-fuzzy-match)
@@ -1063,7 +1114,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
   (if (not (and (eq matcher #'neo-scope-orderless-match) (require 'orderless nil t)))
       (let ((neo-scope--fuzzy-query-cache
              (when (eq matcher #'neo-scope-fuzzy-match)
-               (cons query (vconcat (mapcar #'char-to-string (downcase query)))))))
+               (cons query (neo-scope--fuzzy-components query)))))
         (cl-loop for candidate in candidates
                for match = (funcall matcher query candidate)
                when match collect (cons candidate match)))
@@ -1086,6 +1137,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
 (defun neo-scope-orderless-match (query candidate)
   "Match QUERY with Orderless, or use fuzzy matching if unavailable.
 Honor Orderless styles, dispatchers and case settings.  Preserve source order."
+  (setq query (replace-regexp-in-string "[　\t\n\r]" " " query))
   (if (not (require 'orderless nil t)) (neo-scope-fuzzy-match query candidate)
     (let* ((text (or (plist-get candidate :match) (plist-get candidate :label)))
            (completion-lazy-hilit nil)
@@ -1122,7 +1174,8 @@ Consult settings determine regexps, case handling and command arguments."
      :matcher (lambda (_query _candidate) '(0))
      :start
      (lambda (query emit)
-       (if (string-empty-p query)
+       (setq query (replace-regexp-in-string "[　\t\n\r]" " " query))
+       (if (null (neo-scope--query-words query))
            (progn (funcall emit 'done nil) #'ignore)
          (let* ((default-directory root) (stopped nil) (count 0) async
                 (builder (consult--ripgrep-make-builder '("."))))
