@@ -221,58 +221,76 @@ files are not interpreted.  No external executable is required."
    :start
    (lambda (query emit)
      (let ((queue (list root)) (words (neo-scope--query-words query))
-           timer stopped (count 0) (skipped 0) limited)
+           timer stopped scan file (line 1) (previous 1)
+           (count 0) (skipped 0) limited)
        (cl-labels
-           ((finish ()
+           ((stop ()
               (setq stopped t)
+              (when (timerp timer) (cancel-timer timer))
+              (when (buffer-live-p scan) (kill-buffer scan)))
+            (finish ()
+              (stop)
               (funcall emit 'status (concat (when limited "Result limit reached. ")
                                            (when (> skipped 0) (format "Skipped %d entries. " skipped))))
               (funcall emit 'done nil))
             (tick ()
+              (setq timer nil)
               (unless stopped
                 (condition-case err
                     (let ((budget (max 1 neo-scope-batch-size))
                           (deadline (+ (float-time) 0.008)) batch)
-                      (while (and queue (> budget 0) (< (float-time) deadline)
+                      (while (and (or file queue) (> budget 0) (< (float-time) deadline)
                                   (< count neo-scope-max-results))
-                        (let ((file (pop queue)))
-                          (cl-decf budget)
-                          (condition-case nil
+                        (cl-decf budget)
+                        (condition-case nil
+                            (if file
+                                (with-current-buffer scan
+                                  (let ((case-fold-search t))
+                                    (if (not (search-forward (car words) nil t))
+                                        (setq file nil)
+                                      (let ((start (line-beginning-position))
+                                            (end (line-end-position)))
+                                        (setq line (+ line (count-lines previous start)) previous start)
+                                        ;; The UI computes highlights; search only needs a yes/no match.
+                                        (when (cl-every (lambda (word)
+                                                          (goto-char start)
+                                                          (search-forward word end t))
+                                                        (cdr words))
+                                          (push (neo-scope--file-candidate
+                                                 file root line
+                                                 (buffer-substring-no-properties start end)) batch)
+                                          (cl-incf count))
+                                        (goto-char end)
+                                        (forward-line 1)))))
+                              (let ((entry (pop queue)))
                               (cond
-                               ((file-symlink-p file) (cl-incf skipped))
-                               ((file-directory-p file)
-                                (unless (member (file-name-nondirectory (directory-file-name file))
+                               ((file-symlink-p entry) (cl-incf skipped))
+                               ((file-directory-p entry)
+                                (unless (member (file-name-nondirectory (directory-file-name entry))
                                                 neo-scope-excluded-directories)
-                                  (setq queue (nconc (directory-files file t directory-files-no-dot-files-regexp t) queue))))
+                                  (setq queue (nconc (directory-files entry t directory-files-no-dot-files-regexp t) queue))))
                                ((not grep)
-                                (push (neo-scope--file-candidate file root) batch)
+                                (push (neo-scope--file-candidate entry root) batch)
                                 (cl-incf count))
                                (t
-                                (with-temp-buffer
-                                  (insert (neo-scope--read-text file))
+                                (unless (buffer-live-p scan)
+                                  (setq scan (generate-new-buffer " *neo-scope-scan*")))
+                                (with-current-buffer scan
+                                  (erase-buffer)
+                                  (insert (neo-scope--read-text entry))
                                   (goto-char (point-min))
-                                  (let ((case-fold-search t) (line 1) (previous (point-min)))
-                                    (while (and (< count neo-scope-max-results)
-                                                (search-forward (car words) nil t))
-                                      (let ((start (line-beginning-position)))
-                                        (setq line (+ line (count-lines previous start)) previous start)
-                                        (when (neo-scope-literal-match
-                                               query (list :label (buffer-substring-no-properties start (line-end-position))))
-                                        (push (neo-scope--file-candidate
-                                               file root line
-                                               (buffer-substring-no-properties start (line-end-position))) batch)
-                                        (cl-incf count))
-                                        (forward-line 1)))))))
-                            (error (cl-incf skipped)))))
+                                  (setq file entry line 1 previous (point-min)))))))
+                          (error (setq file nil) (cl-incf skipped))))
                       (when batch (funcall emit 'add (nreverse batch)))
-                      (setq limited (>= count neo-scope-max-results))
-                      (if (or (null queue) limited) (finish)
-                        (setq timer (run-at-time 0.01 nil #'tick))))
-                  (error (setq stopped t) (funcall emit 'error (error-message-string err)))))))
+                      (unless stopped
+                        (setq limited (>= count neo-scope-max-results))
+                        (if (or (not (or file queue)) limited) (finish)
+                          (setq timer (run-at-time 0.001 nil #'tick)))))
+                  (error (stop) (funcall emit 'error (error-message-string err)))))))
          (if (and grep (null words))
              (setq timer (run-at-time 0 nil (lambda () (unless stopped (finish)))))
-           (setq timer (run-at-time 0 nil #'tick))))
-       (lambda () (setq stopped t) (when (timerp timer) (cancel-timer timer)))))))
+           (setq timer (run-at-time 0 nil #'tick)))
+         #'stop)))))
 
 (defun neo-scope-file-source (root &optional grep)
   "Return a file source for ROOT, or a literal GREP source.

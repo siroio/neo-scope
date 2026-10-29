@@ -55,6 +55,8 @@ Evilが有効でも検索画面はEmacs状態で開き、すぐに文字を入�
 
 `rg` があればファイル一覧を非同期で取得します。未導入なら従来のElisp列挙を使用し、`neo-scope-use-ripgrep` をnilにすると明示的に無効にできます。自作ソースの `.gitignore` を使わない方針は維持します。コードの色付きプレビューは最大16件を保持し、ファイルのサイズ・更新時刻・属性変更時刻、編集中バッファの変更に応じて更新します。
 
+標準の全文検索は同じEmacs内で動きます。ファイル内の一致行の走査も8msを目安に、または `neo-scope-batch-size` の件数で区切り、入力へ制御を返します。検索用の別プロセスやスレッドは起動しません。ファイル読取・ディレクトリ列挙自体は同期処理です。
+
 自作ファジーマッチでは、列挙・照合完了後に検索語を末尾へ追加したとき、前の結果から絞り込みます。検索語を削除した場合やmatcherを変更した場合は全候補を再照合します。結果数や同点の取得順は維持します。
 
 自作ファジーマッチは入力の半角・全角スペースやタブを語の区切りとして扱います。`neo scope` と `scope neo` はどちらも `neo-scope.el` に一致します。各語は部分列で照合し、すべての語が一致する候補を表示します。空白だけなら全候補を表示します。Verticoでも同じ照合を使用します。Orderless連携は同様に語で絞り込み、正規表現やdispatcher等はOrderlessの設定に従います。
@@ -125,6 +127,25 @@ PNG/JPEG/GIF/WebP/BMP/TIFF/SVG/AVIF/ICO等の画像を振り分け、実際に�
 
 マッチャー `(QUERY CANDIDATE)` は非一致ならnil、一致なら `(SCORE . POSITIONS)` を返します。POSITIONSは0始まりの文字位置で、`:label` と `:match` が同じなら強調に使います。スコア降順、同点は取得順を維持します。プレビュー関数 `(CANDIDATE BUFFER)` は指定バッファへ描画し、確定関数 `(CANDIDATE)` はFinderを閉じた後に呼ばれます。
 
+## Consultの検索結果をEmbarkから引き継ぐ
+
+任意連携ファイル `neo-scope-embark.el` を読み込むと、Consultなどで絞り込んだ候補一覧をneo-scopeへ渡せます。リポジトリを `load-path` に追加した環境、または `package-vc` で導入した環境で設定します。
+
+```elisp
+(with-eval-after-load 'embark
+  (require 'neo-scope-embark)
+  (neo-scope-embark-setup))
+;; C-. が未設定なら、別途 (global-set-key (kbd "C-.") #'embark-act)
+```
+
+1. `consult-line`、`consult-ripgrep`、ファイル・バッファ選択などで候補を絞る。
+2. `C-. A N` で候補一覧をneo-scopeへ移す。Embarkで選択済みの候補があればその集合を使う。`C-. N` は1件だけを渡す。
+3. 空の入力欄へ追加の語を入力して絞り込み、プレビューを見て `RET` で開く。`C-g` で元の編集画面へ戻る。
+
+切り替え時点の候補の順序と移動位置を保持します。元の検索式は適用済みなので、新しい入力欄は空で始まります。元の非同期検索は継続せず、候補は追加されません。
+
+ローカルファイル、バッファ、Consultの行・grep候補、ファイルとバッファの混在、Embark Collectからの引き継ぎに対応します。Consultの位置情報には `embark-consult` を使用します。対応外の種別・空一覧・リモート・消えた対象はエラーで知らせます。標準のcollect/exportは維持し、このアクションではミニバッファを閉じてからneo-scopeを開きます。一般マップの `N` が既に使われている場合、設定を上書きせず知らせます。
+
 ## Consult・Orderless・Verticoとの任意連携
 
 各パッケージは必要な機能を呼ぶときだけ読み込みます。自動インストールはしません。未導入の場合は自作の検索・照合・表示へ戻ります。
@@ -184,6 +205,8 @@ GUIテストは独立したEmacsで `-Q -l tests/neo-scope-gui.el` を指定し�
 任意連携の実パッケージ・GUI検証は[連携検証記録](docs/integrations-verification.md)を参照してください。
 
 速度と操作の改善は[応答性の検証記録](docs/responsiveness-verification.md)を参照してください。
+
+Embarkからの候補引き継ぎと同一Emacs内の全文検索改善は[検証記録](docs/embark-grep-verification.md)を参照してください。
 
 ## 設計
 
