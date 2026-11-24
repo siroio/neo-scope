@@ -35,6 +35,11 @@
 (defcustom neo-scope-grep-delay 0.12
   "Seconds to wait before restarting a query-dependent search."
   :type 'number)
+(defcustom neo-scope-grep-unsaved-buffers nil
+  "Search modified file buffers in the built-in grep source.
+Use their current text in place of the file on disk.  The Consult
+ripgrep source follows its own file and regexp settings."
+  :type 'boolean)
 (defcustom neo-scope-preview-delay 0.08 "Seconds before previewing selection."
   :type 'number)
 (defcustom neo-scope-ffprobe-program "ffprobe"
@@ -82,6 +87,7 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 
 (defvar neo-scope-history nil "Queries entered in neo-scope.")
 (defvar neo-scope--session nil)
+(defvar neo-scope--last-search nil "Most recently closed project search.")
 (defvar neo-scope-input-map)
 (defvar neo-scope-panel-map)
 (defvar neo-scope--fuzzy-query-cache nil)
@@ -97,7 +103,7 @@ POSITIONS are zero-based character offsets in the candidate's :match string."
 (cl-defstruct (neo-scope--state (:constructor neo-scope--make-state))
   source parent origin frame window-config input candidates preview list-window preview-window
   input-window (generation 0) (query "") cancel query-timer match-timer
-  preview-timer preview-key all tail ids pending ranked matches (selection 0)
+  preview-timer preview-key all tail ids pending ranked matches (selection 0) restore-id
   (revision 0) (history-index -1) (draft "") status done closed accept-pending render-key matched-matcher)
 
 (defun neo-scope--query-words (query)
@@ -209,6 +215,18 @@ order; contiguous and boundary matches score higher."
     (when (search-forward "\0" nil t) (error "Binary file"))
     (buffer-string)))
 
+(defun neo-scope--grep-buffer-text (buffer)
+  "Read the full text of BUFFER for grep, applying the binary and size limits."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (when (> (1- (position-bytes (point-max))) neo-scope-max-file-size)
+        (error "Buffer is too large"))
+      (save-excursion
+        (goto-char (point-min))
+        (when (search-forward "\0" nil t) (error "Binary buffer")))
+      (buffer-substring-no-properties (point-min) (point-max)))))
+
 (defun neo-scope--elisp-file-source (root &optional grep)
   "Return a batched local file source for ROOT.
 If GREP is non-nil, search literal QUERY case-insensitively in text files.
@@ -220,9 +238,25 @@ files are not interpreted.  No external executable is required."
    :matcher (when grep #'neo-scope-literal-match)
    :start
    (lambda (query emit)
-     (let ((queue (list root)) (words (neo-scope--query-words query))
-           timer stopped scan file (line 1) (previous 1)
-           (count 0) (skipped 0) limited)
+     (let* ((queue (list root)) (words (neo-scope--query-words query))
+            (live-text (and grep neo-scope-grep-unsaved-buffers))
+            (path-key (if (and live-text (file-name-case-insensitive-p root)) #'downcase #'identity))
+            (edited-files (and live-text (make-hash-table :test 'equal)))
+            (new-files (and live-text (make-hash-table :test 'equal)))
+            timer stopped scan file edited tick (line 1) (previous 1)
+            (count 0) (skipped 0) limited)
+       ;; Include as-yet unwritten files only when the normal traversal
+       ;; reaches their parent.  Exclusions and symlinks still apply.
+       (when (and live-text words)
+         (dolist (buffer (buffer-list))
+           (when-let* ((path (buffer-file-name buffer))
+                       ((buffer-modified-p buffer))
+                       ((not (file-remote-p path)))
+                       ((file-in-directory-p path root)))
+             (puthash (funcall path-key path) buffer edited-files)
+             (unless (file-exists-p path)
+               (push path (gethash (funcall path-key (directory-file-name (file-name-directory path)))
+                                   new-files))))))
        (cl-labels
            ((stop ()
               (setq stopped t)
@@ -256,9 +290,13 @@ files are not interpreted.  No external executable is required."
                                                           (goto-char start)
                                                           (search-forward word end t))
                                                         (cdr words))
-                                          (push (neo-scope--file-candidate
-                                                 file root line
-                                                 (buffer-substring-no-properties start end)) batch)
+                                          (let ((candidate (neo-scope--file-candidate
+                                                            file root line
+                                                            (buffer-substring-no-properties start end))))
+                                            (when edited
+                                              (setf (plist-get (plist-get candidate :value) :buffer) edited
+                                                    (plist-get (plist-get candidate :value) :grep-tick) tick))
+                                            (push candidate batch))
                                           (cl-incf count))
                                         (goto-char end)
                                         (forward-line 1)))))
@@ -268,7 +306,10 @@ files are not interpreted.  No external executable is required."
                                ((file-directory-p entry)
                                 (unless (member (file-name-nondirectory (directory-file-name entry))
                                                 neo-scope-excluded-directories)
-                                  (setq queue (nconc (directory-files entry t directory-files-no-dot-files-regexp t) queue))))
+                                  (setq queue (nconc (directory-files entry t directory-files-no-dot-files-regexp t)
+                                                     (and new-files (gethash (funcall path-key (directory-file-name entry))
+                                                                             new-files))
+                                                     queue))))
                                ((not grep)
                                 (push (neo-scope--file-candidate entry root) batch)
                                 (cl-incf count))
@@ -277,7 +318,13 @@ files are not interpreted.  No external executable is required."
                                   (setq scan (generate-new-buffer " *neo-scope-scan*")))
                                 (with-current-buffer scan
                                   (erase-buffer)
-                                  (insert (neo-scope--read-text entry))
+                                  (setq edited (and edited-files (gethash (funcall path-key entry) edited-files)))
+                                  (if (and (buffer-live-p edited) (buffer-modified-p edited))
+                                      (progn
+                                        (setq tick (buffer-chars-modified-tick edited))
+                                        (insert (neo-scope--grep-buffer-text edited)))
+                                    (setq edited nil)
+                                    (insert (neo-scope--read-text entry)))
                                   (goto-char (point-min))
                                   (setq file entry line 1 previous (point-min)))))))
                           (error (setq file nil) (cl-incf skipped))))
@@ -593,6 +640,13 @@ Return an idempotent cancel function.  Callback is never called after cancel."
           (insert-image (create-image file type nil :max-width (max 1 (- width 20))
                                       :max-height (max 1 (- height 220))))))))))
 
+(defun neo-scope--check-grep-buffer (value)
+  "Require an unsaved grep result in VALUE to still describe the live text."
+  (when-let* ((tick (plist-get value :grep-tick)))
+    (let ((buffer (plist-get value :buffer)))
+      (unless (and (buffer-live-p buffer) (= tick (buffer-chars-modified-tick buffer)))
+        (user-error "Buffer changed since grep; resume the search to refresh results")))))
+
 (defun neo-scope-preview (candidate buffer)
   "Render file information and type-specific content in owned BUFFER.
 Media metadata is asynchronous and optional.  Kill or replace the preview
@@ -601,11 +655,13 @@ to cancel its process.  Existing text buffers remain unchanged."
   (let* ((value (plist-get candidate :value))
          (source (plist-get value :buffer))
          (file (or (plist-get value :file) (and (buffer-live-p source) (buffer-file-name source))))
-         (ext (and file (downcase (or (file-name-extension file) ""))))
+         (ext (and file (not (plist-get value :grep-tick))
+                   (downcase (or (file-name-extension file) ""))))
          (media (member ext '("mp4" "mkv" "webm" "mov" "avi" "m4v" "mpeg" "mpg" "wmv"
                               "mp3" "wav" "flac" "ogg" "opus" "m4a" "aac" "wma" "aiff")))
          (picture (member ext '("png" "jpg" "jpeg" "gif" "webp" "bmp" "tif" "tiff" "svg" "avif" "ico")))
          (token (list candidate)) general compact)
+    (neo-scope--check-grep-buffer value)
     (when (and file (file-remote-p file)) (user-error "Remote preview is not supported"))
     (setq source (or source (and file (get-file-buffer file))))
     (setq compact (with-current-buffer buffer
@@ -664,9 +720,19 @@ to cancel its process.  Existing text buffers remain unchanged."
   "Visit CANDIDATE in the originating window after the finder has closed."
   (let* ((value (plist-get candidate :value)) (buffer (plist-get value :buffer))
          (file (plist-get value :file)))
+    (neo-scope--check-grep-buffer value)
     (cond
      (buffer (unless (buffer-live-p buffer) (user-error "Buffer no longer exists"))
-             (switch-to-buffer buffer))
+             (switch-to-buffer buffer)
+             (when (plist-get value :grep-tick)
+               (let ((position (save-restriction
+                                 (widen)
+                                 (save-excursion
+                                   (goto-char (point-min))
+                                   (forward-line (1- (plist-get value :line)))
+                                   (point)))))
+                 (unless (<= (point-min) position (point-max)) (widen))
+                 (goto-char position))))
      (file (unless (file-exists-p file) (user-error "File no longer exists: %s" file))
            (find-file file)
            (goto-char (point-min)) (forward-line (1- (or (plist-get value :line) 1))))
@@ -702,7 +768,10 @@ to cancel its process.  Existing text buffers remain unchanged."
       ('done (setf (neo-scope--state-done s) t))
       ('error (setf (neo-scope--state-done s) t
                     (neo-scope--state-status s) (concat "Error: " payload))))
-    (unless (eq event 'add) (neo-scope--render s))))
+    (unless (eq event 'add) (neo-scope--render s))
+    (when (and (memq event '(done error)) (neo-scope--state-accept-pending s)
+               (not (neo-scope--state-pending s)))
+      (neo-scope-accept))))
 
 (defun neo-scope--start-source (s)
   (cl-incf (neo-scope--state-generation s))
@@ -747,7 +816,12 @@ to cancel its process.  Existing text buffers remain unchanged."
                   (cl-merge 'list (neo-scope--state-ranked s)
                             (cl-stable-sort batch #'> :key #'cadr)
                             #'> :key #'cadr)
-                  (neo-scope--state-matches s) (vconcat (neo-scope--state-ranked s)))))
+                  (neo-scope--state-matches s) (vconcat (neo-scope--state-ranked s)))
+            ;; Later batches can move a previously restored candidate.
+            (when-let* ((id (neo-scope--state-restore-id s))
+                        (index (cl-position id (neo-scope--state-matches s) :test #'equal
+                                            :key (lambda (row) (plist-get (car row) :id)))))
+              (setf (neo-scope--state-selection s) index))))
           (neo-scope--render s)
           (neo-scope--schedule-preview s)
           (if (neo-scope--state-pending s) (neo-scope--schedule-match s)
@@ -760,7 +834,7 @@ to cancel its process.  Existing text buffers remain unchanged."
     (when (and s (neo-scope--live-p s))
       ;; Invalidate old selection immediately; RET must never open stale results.
       (cl-incf (neo-scope--state-revision s))
-      (setf (neo-scope--state-accept-pending s) nil)
+      (setf (neo-scope--state-accept-pending s) nil (neo-scope--state-restore-id s) nil)
       (when (plist-get (neo-scope--state-source s) :query-dependent)
         (cl-incf (neo-scope--state-generation s))
         (when (neo-scope--state-cancel s)
@@ -894,7 +968,8 @@ to cancel its process.  Existing text buffers remain unchanged."
   (interactive)
   (let ((s neo-scope--session))
     (when s
-      (setf (neo-scope--state-selection s)
+      (setf (neo-scope--state-restore-id s) nil
+            (neo-scope--state-selection s)
             (max 0 (min (max 0 (1- (length (neo-scope--state-matches s))))
                         (+ (neo-scope--state-selection s) (or delta 1)))))
       (neo-scope--render s) (neo-scope--schedule-preview s))))
@@ -941,6 +1016,12 @@ to cancel its process.  Existing text buffers remain unchanged."
   (when neo-scope--owner
     (neo-scope--close neo-scope--owner nil (current-buffer))))
 
+(defun neo-scope--remember-search (source query id)
+  "Record QUERY and selected ID for resumable project SOURCE."
+  (when-let* ((kind (plist-get source :search-kind)))
+    (setq neo-scope--last-search (list :kind kind :root (plist-get source :root)
+                                       :query query :id id))))
+
 (defun neo-scope--close (s &optional no-focus killing-buffer)
   (unless (neo-scope--state-closed s)
     (setf (neo-scope--state-closed s) t)
@@ -952,7 +1033,12 @@ to cancel its process.  Existing text buffers remain unchanged."
     (remove-hook 'delete-frame-functions #'neo-scope--frame-deleted)
     (remove-hook 'window-size-change-functions #'neo-scope--parent-resized)
     (when (buffer-live-p (neo-scope--state-input s))
-      (let ((query (with-current-buffer (neo-scope--state-input s) (buffer-string))))
+      (let ((query (with-current-buffer (neo-scope--state-input s)
+                     (buffer-substring-no-properties (point-min) (point-max)))))
+        (neo-scope--remember-search
+         (neo-scope--state-source s) query
+         (and (equal query (neo-scope--state-query s))
+              (plist-get (neo-scope--selected s) :id)))
         (unless (string-empty-p query) (add-to-history 'neo-scope-history query))))
     (when (and (not no-focus) (frame-live-p (neo-scope--state-parent s))
                (window-configuration-p (neo-scope--state-window-config s)))
@@ -979,7 +1065,11 @@ to cancel its process.  Existing text buffers remain unchanged."
         (neo-scope--cancel-timer (neo-scope--state-query-timer s))
         (neo-scope--query s))
       (if (or (neo-scope--state-query-timer s) (neo-scope--state-pending s)
-              (and (not (neo-scope--state-done s)) (not (neo-scope--selected s))))
+              (and (not (neo-scope--state-done s))
+                   (or (not (neo-scope--selected s))
+                       (and (neo-scope--state-restore-id s)
+                            (not (equal (neo-scope--state-restore-id s)
+                                        (plist-get (neo-scope--selected s) :id)))))))
           (setf (neo-scope--state-accept-pending s) t)
         (when-let* ((candidate (neo-scope--selected s)))
           (let ((action (or (plist-get (neo-scope--state-source s) :action) #'neo-scope-action)))
@@ -1048,6 +1138,8 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
   (when neo-scope--session (neo-scope--close neo-scope--session))
   (let* ((parent (selected-frame)) (size (neo-scope--dimensions parent))
          (s (neo-scope--make-state :source source :parent parent :frame parent
+                                   :query (or (plist-get source :initial-query) "")
+                                   :restore-id (plist-get source :initial-id)
                                    :window-config (current-window-configuration)
                                    :origin (selected-window))))
     (when (or (< (car size) 30) (< (cdr size) 8)) (user-error "Frame is too small for neo-scope"))
@@ -1070,6 +1162,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
             (setq-local buffer-read-only nil cursor-type 'bar neo-scope--owner s
                         line-prefix (propertize "› " 'face 'neo-scope-title))
             (use-local-map neo-scope-input-map)
+            (insert (neo-scope--state-query s))
             (add-hook 'after-change-functions #'neo-scope--input-changed nil t))
           (with-current-buffer (neo-scope--state-preview s) (setq neo-scope--details nil))
           (with-selected-frame (neo-scope--state-frame s)
@@ -1094,12 +1187,30 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
           s)
       ((error quit) (neo-scope--close s) (signal (car err) (cdr err))))))
 
+(defun neo-scope--project-search (kind root &optional query id)
+  "Open a fresh project source for KIND at ROOT with optional QUERY and ID."
+  (let ((source (if (eq kind 'grep) (funcall neo-scope-file-source-function root t)
+                  (funcall neo-scope-file-source-function root))))
+    (funcall neo-scope-display-function
+             (append (list :search-kind kind :root root :initial-query query :initial-id id) source))))
+
+;;;###autoload
+(defun neo-scope-resume ()
+  "Repeat the last project file search or grep, restoring query and selection."
+  (interactive)
+  (when (and neo-scope--session (plist-get (neo-scope--state-source neo-scope--session) :search-kind))
+    (neo-scope--close neo-scope--session))
+  (unless neo-scope--last-search (user-error "No previous neo-scope project search"))
+  (neo-scope--project-search (plist-get neo-scope--last-search :kind)
+                             (neo-scope--local-root (plist-get neo-scope--last-search :root))
+                             (plist-get neo-scope--last-search :query)
+                             (plist-get neo-scope--last-search :id)))
+
 ;;;###autoload
 (defun neo-scope-find-file (&optional choose)
   "Find a project file.  With prefix CHOOSE, prompt for a root directory."
   (interactive "P")
-  (funcall neo-scope-display-function
-           (funcall neo-scope-file-source-function (neo-scope--root choose))))
+  (neo-scope--project-search 'file (neo-scope--root choose)))
 
 ;;;###autoload
 (defun neo-scope-buffer () "Select a live buffer." (interactive)
@@ -1109,8 +1220,7 @@ CANDIDATE after closing.  Late callbacks after cancellation are ignored."
 (defun neo-scope-grep (&optional choose)
   "Search literal text in the project.  With prefix CHOOSE, choose a root."
   (interactive "P")
-  (funcall neo-scope-display-function
-           (funcall neo-scope-file-source-function (neo-scope--root choose) t)))
+  (neo-scope--project-search 'grep (neo-scope--root choose)))
 
 (defun neo-scope--match-candidates (query candidates matcher)
   "Match CANDIDATES, compiling Orderless once per batch instead of per item."
@@ -1268,15 +1378,21 @@ Consult settings determine regexps, case handling and command arguments."
            0))))
 
 (defvar vertico--input)
+(defvar vertico--candidates)
+(defvar vertico--index)
+(defvar vertico--lock-candidate)
 (declare-function vertico--exhibit "vertico" ())
+(declare-function vertico--update "vertico" (&optional interruptible))
+(declare-function vertico--goto "vertico" (index))
 
-(defun neo-scope--vertico-refresh (buffer)
+(defun neo-scope--vertico-refresh (buffer &optional restore)
   "Refresh live results in the active Vertico BUFFER only."
   (when (and (buffer-live-p buffer) (active-minibuffer-window)
              (eq buffer (window-buffer (active-minibuffer-window))))
     (with-current-buffer buffer
       ;; Vertico caches unchanged input; invalidate it when async results arrive.
       (when (boundp 'vertico--input) (setq vertico--input nil))
+      (when restore (funcall restore))
       (when (fboundp 'vertico--exhibit) (vertico--exhibit)))))
 
 ;;;###autoload
@@ -1287,8 +1403,10 @@ Query-dependent sources restart after input changes in the same minibuffer."
     (when neo-scope--session (neo-scope--close neo-scope--session))
     (let* ((dependent (plist-get source :query-dependent))
            (counts (make-hash-table :test 'equal)) (ids (make-hash-table :test 'equal))
-           choices tail cancel query-timer refresh-timer buffer change-hook
-           (generation 0) (alive t) (number 0) (input "") (was-enabled vertico-mode)
+           choices tail cancel query-timer refresh-timer buffer selected-id
+           (restore-id (plist-get source :initial-id))
+           (generation 0) (alive t) (number 0) (input (or (plist-get source :initial-query) ""))
+           (was-enabled vertico-mode)
            (completion-styles-alist
             (cons '(neo-scope-fuzzy
                     (lambda (string _table _pred point) (cons string point))
@@ -1309,9 +1427,17 @@ Query-dependent sources restart after input changes in the same minibuffer."
            (completion-category-overrides
             (cons `(neo-scope (styles . ,completion-styles)) completion-category-overrides)))
       (cl-labels
-          ((refresh ()
+          ((restore ()
+             (when-let* ((name (gethash restore-id ids)))
+               (unless vertico--lock-candidate
+                 (vertico--update)
+                 (when-let* ((index (seq-position vertico--candidates name #'equal)))
+                   (vertico--goto index)))
+               (setq restore-id nil)))
+           (refresh ()
              (neo-scope--cancel-timer refresh-timer)
-             (setq refresh-timer (run-at-time 0 nil #'neo-scope--vertico-refresh buffer)))
+             (setq refresh-timer (run-at-time 0 nil #'neo-scope--vertico-refresh buffer
+                                              (and restore-id #'restore))))
            (start (query)
              (setq query-timer nil)
              (let ((version generation))
@@ -1326,8 +1452,8 @@ Query-dependent sources restart after input changes in the same minibuffer."
                                            (dolist (c payload)
                                              (when (and (< number neo-scope-max-results)
                                                         (not (gethash (plist-get c :id) ids)))
-                                               (puthash (plist-get c :id) t ids)
                                                (let ((name (format "%s [%d]" (plist-get c :label) (cl-incf number))))
+                                                 (puthash (plist-get c :id) name ids)
                                                  (puthash name c counts) (push name batch))))
                                            (setq batch (nreverse batch))
                                            (if tail (setcdr tail batch) (setq choices batch))
@@ -1341,21 +1467,29 @@ Query-dependent sources restart after input changes in the same minibuffer."
                           (with-current-buffer buffer
                             (minibuffer-message "%s" (error-message-string err))))))))
            (changed (&rest _)
-             (when (and alive dependent (not (memq this-command '(vertico-exit exit-minibuffer))))
+             (when (and alive (not (memq this-command '(vertico-exit exit-minibuffer))))
                (let ((query (minibuffer-contents-no-properties)))
                  (unless (equal query input)
-                   (setq input query)
-                   (cl-incf generation)
-                   (when cancel (funcall cancel) (setq cancel nil))
-                   (setq choices nil tail nil number 0)
-                   (clrhash counts) (clrhash ids)
-                   (neo-scope--cancel-timer query-timer)
-                   (setq query-timer (run-at-time neo-scope-grep-delay nil #'start query))))))
+                   (setq input query restore-id nil)
+                   (when dependent
+                     (cl-incf generation)
+                     (when cancel (funcall cancel) (setq cancel nil))
+                     (setq choices nil tail nil number 0)
+                     (clrhash counts) (clrhash ids)
+                     (neo-scope--cancel-timer query-timer)
+                     (setq query-timer (run-at-time neo-scope-grep-delay nil #'start query)))))))
+           (exiting ()
+             (when (and (boundp 'vertico--index) (>= vertico--index 0)
+                        (equal (car-safe vertico--input) input))
+               (setq selected-id (plist-get (gethash (nth vertico--index vertico--candidates) counts) :id))))
            (setup ()
-             (setq buffer (current-buffer) change-hook #'changed)
-             (when dependent (add-hook 'after-change-functions change-hook nil t))
-             (setq input (if dependent (minibuffer-contents-no-properties) ""))
-             (start input)))
+             (setq buffer (current-buffer))
+             (when (or dependent (plist-get source :search-kind))
+               (add-hook 'after-change-functions #'changed nil t)
+               (setq input (minibuffer-contents-no-properties)))
+             (when (plist-get source :search-kind)
+               (add-hook 'minibuffer-exit-hook #'exiting nil t))
+             (start (if dependent input ""))))
         (unwind-protect
             (progn
               (unless was-enabled (vertico-mode 1))
@@ -1367,15 +1501,19 @@ Query-dependent sources restart after input changes in the same minibuffer."
                                 (complete-with-action action choices string pred))))
                      (selected (minibuffer-with-setup-hook (:append #'setup)
                                  (completing-read (concat (plist-get source :name) ": ")
-                                                  table nil t nil 'neo-scope-history))))
+                                                  table nil t (plist-get source :initial-query) 'neo-scope-history))))
                 (when-let* ((candidate (gethash selected counts)))
+                  (setq selected-id (plist-get candidate :id))
                   (funcall (or (plist-get source :action) #'neo-scope-action) candidate))))
           (setq alive nil)
+          (when buffer (neo-scope--remember-search source input selected-id))
           (neo-scope--cancel-timer query-timer)
           (neo-scope--cancel-timer refresh-timer)
           (when cancel (funcall cancel))
           (when (buffer-live-p buffer)
-            (with-current-buffer buffer (remove-hook 'after-change-functions change-hook t)))
+            (with-current-buffer buffer
+              (remove-hook 'after-change-functions #'changed t)
+              (remove-hook 'minibuffer-exit-hook #'exiting t)))
           (unless was-enabled (vertico-mode -1)))))))
 
 (provide 'neo-scope)

@@ -13,7 +13,7 @@ Emacs 30以降の標準use-packageでGitHubから導入できます。取得に�
 ```elisp
 (use-package neo-scope
   :vc (:url "https://github.com/siroio/neo-scope" :rev :newest)
-  :commands (neo-scope-find-file neo-scope-buffer neo-scope-grep))
+  :commands (neo-scope-find-file neo-scope-buffer neo-scope-grep neo-scope-resume))
 ```
 
 `:rev :newest` は導入時に最新コミットを選びます。起動のたびに自動更新する指定ではありません。`:commands` によりコマンドを呼ぶまで本体の読み込みを遅延します。
@@ -32,8 +32,11 @@ Emacs 29.1では `package-vc-install` を使用できます。手元の本体は
 | `neo-scope-find-file` | プロジェクト内のファイル検索。プロジェクト外なら現在のディレクトリ以下 |
 | `neo-scope-buffer` | 通常のバッファを切り替え。編集中の内容をプレビュー |
 | `neo-scope-grep` | ローカルファイル内の語を順不同でAND検索。自作ソースはリテラル・大文字小文字を区別しない |
+| `neo-scope-resume` | 直前のファイル検索・全文検索を同じルート・検索語でやり直し、前回選んでいた候補に戻る |
 
 ファイル検索・全文検索は `C-u M-x …` でルートを選択できます。
+
+`neo-scope-resume` は確定・キャンセルのどちらからも使えます。候補を取り直すので、新しいファイルや編集が結果に反映されます。前回のファイル（grep はファイルと行番号）が結果から消えていれば、先頭の候補を選びます。標準画面と Vertico で再開でき、バッファ切り替えや Embark の候補一覧を開いても記録は残ります。記録は実行中の Emacs に1件だけ保持します。
 
 | キー | 操作 |
 | --- | --- |
@@ -56,6 +59,8 @@ Evilが有効でも検索画面はEmacs状態で開き、すぐに文字を入�
 `rg` があればファイル一覧を非同期で取得します。未導入なら従来のElisp列挙を使用し、`neo-scope-use-ripgrep` をnilにすると明示的に無効にできます。自作ソースの `.gitignore` を使わない方針は維持します。コードの色付きプレビューは最大16件を保持し、ファイルのサイズ・更新時刻・属性変更時刻、編集中バッファの変更に応じて更新します。
 
 標準の全文検索は同じEmacs内で動きます。ファイル内の一致行の走査も8msを目安に、または `neo-scope-batch-size` の件数で区切り、入力へ制御を返します。検索用の別プロセスやスレッドは起動しません。ファイル読取・ディレクトリ列挙自体は同期処理です。
+
+未保存の編集も検索するには `(setq neo-scope-grep-unsaved-buffers t)` を設定します。標準の全文検索では、変更済みのローカルファイルは編集中のバッファ全体を検索します。そのファイルの保存済みの行は結果に混ざりません。検索対象のディレクトリに新規作成してまだ保存していないファイルも対象です。プレビューと確定は同じバッファの該当行を使います。結果が出た後に本文が変わった場合は `M-x neo-scope-resume` で取り直せます。除外ディレクトリ・サイズ上限・バイナリ判定は引き続き適用されます。Consult の ripgrep は従来どおりディスクを検索します。
 
 自作ファジーマッチでは、列挙・照合完了後に検索語を末尾へ追加したとき、前の結果から絞り込みます。検索語を削除した場合やmatcherを変更した場合は全候補を再照合します。結果数や同点の取得順は維持します。
 
@@ -155,7 +160,7 @@ neo-scopeの画面を維持し、Orderlessによる照合とConsultのripgrepを
 ```elisp
 (use-package neo-scope
   :vc (:url "https://github.com/siroio/neo-scope" :rev :newest)
-  :commands (neo-scope-find-file neo-scope-buffer neo-scope-grep)
+  :commands (neo-scope-find-file neo-scope-buffer neo-scope-grep neo-scope-resume)
   :custom
   (neo-scope-list-ratio 0.4)
   (neo-scope-matcher #'neo-scope-orderless-match)
@@ -184,7 +189,7 @@ Verticoモードは列挙完了を待たずに選択画面を開き、届いた�
 
 - 自作画面はGUI専用です。Verticoモードは通常のミニバッファを使用します。TRAMP検索には対応していません。
 - 自作ソースは `.gitignore` を解釈しません。除外ディレクトリの設定を使用し、シンボリックリンクは追跡しません。Consultのripgrepソースはrgの設定に従います。
-- grepは保存済みのファイル内容を検索します。自作ソースはスペースで区切ったリテラルの語を同じ行で順不同AND検索します。空白だけでは検索しません。ConsultソースはConsultの正規表現・複数語の仕様に従います。
+- grepは既定で保存済みのファイル内容を検索します。自作ソースはスペースで区切ったリテラルの語を同じ行で順不同AND検索します。空白だけでは検索しません。ConsultソースはConsultの正規表現・複数語の仕様に従います。
 - grepではバイナリ・サイズ上限超過・読込失敗をスキップし、件数を表示します。候補上限に達した場合も表示します。プレビューでは基本情報を残して、本文や詳細を表示できない理由を示します。
 - 処理はタイマーで分割しますが、並列I/Oではありません。巨大ディレクトリの列挙や遅いドライブは同期I/Oの待ち時間が残ります。
 - 起動中のFinderは1つです。再起動時には前のセッションを閉じます。

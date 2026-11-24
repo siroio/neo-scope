@@ -77,3 +77,76 @@
   (neo-scope-grep-test-with-files
     (cl-letf (((symbol-function 'make-process) (lambda (&rest _) (ert-fail "Unexpected process"))))
       (should-not (neo-scope--collect (neo-scope-file-source root t) "　 \t")))))
+
+(ert-deftest neo-scope-grep-unsaved-replaces-disk-and-visits-live-line ()
+  (neo-scope-grep-test-with-files
+    (let* ((create-lockfiles nil) (auto-save-default nil)
+           (file (expand-file-name "日本.txt" root))
+           (edited (find-file-noselect file))
+           (preview (generate-new-buffer " *scope-test-preview*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer edited
+              (erase-buffer) (insert "new heading\nline two\nalpha live\n")
+              (goto-char 2) (narrow-to-region 1 3))
+            (let ((neo-scope-grep-unsaved-buffers nil))
+              (should (= 3 (length (neo-scope--collect (neo-scope-file-source root t) "alpha")))))
+            (let* ((neo-scope-grep-unsaved-buffers t)
+                   (hits (neo-scope--collect (neo-scope-file-source root t) "alpha"))
+                   (hit (car hits)))
+              (should (= 1 (length hits)))
+              (should (equal (plist-get hit :id) (cons file 3)))
+              (should (eq edited (plist-get (plist-get hit :value) :buffer)))
+              (neo-scope-preview hit preview)
+              (with-current-buffer preview (should (looking-at "alpha live")))
+              (with-current-buffer edited (should (= 2 (point))) (should (buffer-narrowed-p)))
+              (save-window-excursion
+                (neo-scope-action hit)
+                (should (eq (current-buffer) edited)) (should (looking-at "alpha live"))
+                (insert "changed "))
+              (should-error (neo-scope-action hit) :type 'user-error)
+              (should-error (neo-scope-preview hit preview) :type 'user-error)
+              (should (string-match-p "Alpha before" (neo-scope--read-text file)))))
+        (with-current-buffer edited (set-buffer-modified-p nil)) (kill-buffer edited)
+        (kill-buffer preview)))))
+
+(ert-deftest neo-scope-grep-unsaved-includes-new-files-and-honors-filters ()
+  (neo-scope-grep-test-with-files
+    (let ((create-lockfiles nil) (auto-save-default nil) buffers
+          (neo-scope-grep-unsaved-buffers t) (neo-scope-max-file-size 12)
+          (neo-scope-excluded-directories '("ignored")))
+      (unwind-protect
+          (progn
+            (make-directory (expand-file-name "ignored" root))
+            (make-directory (expand-file-name "sub" root))
+            (dolist (item '(("sub/new.txt" . "hit") ("ignored/new.txt" . "hit")
+                            ("binary.txt" . "hit\0") ("large.txt" . "hit日本日本日本")))
+              (let ((buffer (find-file-noselect (expand-file-name (car item) root))))
+                (push buffer buffers) (with-current-buffer buffer (insert (cdr item)))))
+            (let ((hits (neo-scope--collect (neo-scope-file-source root t) "hit")))
+              (should (equal (mapcar (lambda (c) (plist-get c :id)) hits)
+                             (list (cons (expand-file-name "sub/new.txt" root) 1)))))
+            (should-not (file-exists-p (expand-file-name "sub/new.txt" root))))
+        (dolist (buffer buffers)
+          (with-current-buffer buffer (set-buffer-modified-p nil)) (kill-buffer buffer))))))
+
+(ert-deftest neo-scope-grep-unsaved-finds-file-buffers-through-case-aliases ()
+  (neo-scope-grep-test-with-files
+    (skip-unless (file-name-case-insensitive-p root))
+    (let ((create-lockfiles nil) (auto-save-default nil) buffers
+          (neo-scope-grep-unsaved-buffers t))
+      (unwind-protect
+          (progn
+            (make-directory (expand-file-name "MixedCase" root))
+            (with-temp-file (expand-file-name "MixedCase/Disk.txt" root) (insert "old disk line"))
+            (dolist (name '("mixedcase/disk.TXT" "MIXEDCASE/New.txt"))
+              (let ((buffer (find-file-noselect (expand-file-name name root))))
+                (push buffer buffers)
+                (with-current-buffer buffer (erase-buffer) (insert "edited live line"))))
+            (let ((hits (neo-scope--collect (neo-scope-file-source (upcase root) t) "edited live")))
+              (should (= 2 (length hits)))
+              (should-not (cl-set-difference buffers (mapcar (lambda (c) (plist-get (plist-get c :value) :buffer))
+                                                              hits))))
+            (should-not (neo-scope--collect (neo-scope-file-source (upcase root) t) "old disk")))
+        (dolist (buffer buffers)
+          (with-current-buffer buffer (set-buffer-modified-p nil)) (kill-buffer buffer))))))
